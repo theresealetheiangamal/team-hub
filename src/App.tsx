@@ -18,6 +18,7 @@ import {
   FileText,
   History,
   LogOut,
+  MapPin,
   Menu,
   MessageSquare,
   MoreHorizontal,
@@ -37,7 +38,16 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import { supabase } from './lib/supabase';
 
-type Tab = 'messages' | 'meetings' | 'calendar' | 'tasks' | 'docs' | 'inbox' | 'profile';
+type Tab =
+  | 'messages'
+  | 'meetings'
+  | 'calendar'
+  | 'tasks'
+  | 'docs'
+  | 'history'
+  | 'inbox'
+  | 'profile';
+type HistoryFilter = 'all' | 'tasks' | 'meetings';
 type Workspace = { id: string; name: string; owner_id: string };
 type Channel = { id: string; workspace_id: string; name: string };
 type Profile = {
@@ -64,6 +74,8 @@ type Task = {
   reference_link?: string | null;
   status: 'todo' | 'in_progress' | 'done';
   created_at?: string;
+  updated_at?: string;
+  completed_at?: string;
   created_by?: string;
   target_type?: 'team' | 'personal';
   assignee_id?: string | null;
@@ -85,6 +97,8 @@ type TeamEvent = {
   start_time: string;
   end_time: string;
   meeting_room_id: string | null;
+  meeting_type?: 'online' | 'offline' | null;
+  location?: string | null;
   created_by?: string;
 };
 type DocumentRecord = {
@@ -114,6 +128,10 @@ type NotificationRecord = {
 };
 type PresenceStatus = 'Aktif bekerja' | 'Fokus / Rapat' | 'Istirahat';
 type ModalType = 'help' | null;
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+};
 
 const navigation: { id: Tab; label: string; icon: LucideIcon }[] = [
   { id: 'messages', label: 'Pesan', icon: MessageSquare },
@@ -121,6 +139,7 @@ const navigation: { id: Tab; label: string; icon: LucideIcon }[] = [
   { id: 'calendar', label: 'Kalender', icon: CalendarDays },
   { id: 'tasks', label: 'Tugas', icon: CheckSquare },
   { id: 'docs', label: 'Notulensi', icon: FileText },
+  { id: 'history', label: 'History', icon: History },
   { id: 'inbox', label: 'Kotak Masuk', icon: Bell },
 ];
 
@@ -143,12 +162,45 @@ function getMeetingLink(event: TeamEvent) {
   return `https://meet.jit.si/${encodeURIComponent(room)}`;
 }
 
+function isOnlineEvent(event: TeamEvent) {
+  return event.meeting_type === 'online' || (!event.meeting_type && Boolean(event.meeting_room_id));
+}
+
+function getHistoryPersonName(
+  userId: string | undefined,
+  members: WorkspaceMember[],
+  leaders: { id: string; full_name: string }[],
+  currentUserId?: string,
+  currentUserName?: string | null
+) {
+  if (!userId) return 'Tidak diketahui';
+  return (
+    members.find((member) => member.id === userId)?.full_name ||
+    leaders.find((leader) => leader.id === userId)?.full_name ||
+    (userId === currentUserId ? currentUserName || 'Anda' : 'Anggota')
+  );
+}
+
+function getTaskHistoryDate(task: Task) {
+  return task.completed_at || task.updated_at || task.created_at;
+}
+
+function toDateTimeLocalValue(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+    .toISOString()
+    .slice(0, 16);
+}
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [currentTime, setCurrentTime] = useState(() => Date.now());
   const [activeTab, setActiveTab] = useState<Tab>('messages');
   const [collapsed, setCollapsed] = useState(false);
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
+  const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [search, setSearch] = useState('');
   const [showCreateMenu, setShowCreateMenu] = useState(false);
   const [activeModal, setActiveModal] = useState<ModalType>(null);
@@ -182,6 +234,11 @@ export default function App() {
   const [events, setEvents] = useState<TeamEvent[]>([]);
   const [newEventTitle, setNewEventTitle] = useState('');
   const [newEventDate, setNewEventDate] = useState('');
+  const [newEventMeetingType, setNewEventMeetingType] = useState<'online' | 'offline'>('online');
+  const [newEventLocation, setNewEventLocation] = useState('');
+  const [editingEventId, setEditingEventId] = useState<string | null>(null);
+  const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
+  const [historySearch, setHistorySearch] = useState('');
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
   const [documentTitle, setDocumentTitle] = useState('');
@@ -211,6 +268,7 @@ export default function App() {
   const navigateToTab = (tab: Tab) => {
     setActiveTab(tab);
     setActiveModal(null);
+    setMobileDrawerOpen(false);
   };
   const openProfilePage = () => {
     setSettingsFullName(profile?.full_name || '');
@@ -289,6 +347,34 @@ export default function App() {
       window.clearTimeout(initialTimer);
     };
   }, []);
+
+  useEffect(() => {
+    const handleInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as BeforeInstallPromptEvent);
+    };
+    const handleAppInstalled = () => setInstallPrompt(null);
+    window.addEventListener('beforeinstallprompt', handleInstallPrompt);
+    window.addEventListener('appinstalled', handleAppInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleInstallPrompt);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
+  }, []);
+
+  const installApplication = async () => {
+    if (!installPrompt) return;
+    try {
+      await installPrompt.prompt();
+      const { outcome } = await installPrompt.userChoice;
+      setInstallPrompt(null);
+      if (outcome === 'accepted') showSuccess('Team-Hub berhasil dipasang.');
+    } catch (error) {
+      showError(
+        `Aplikasi tidak dapat dipasang: ${error instanceof Error ? error.message : 'terjadi kesalahan'}`
+      );
+    }
+  };
 
   useEffect(() => {
     if (!isSignUp) return;
@@ -685,14 +771,84 @@ export default function App() {
       : documents;
   }, [documents, search]);
 
+  const historyTasks = useMemo(() => {
+    const term = historySearch.trim().toLowerCase();
+    return visibleTasks
+      .filter((task) => task.status === 'done' || Boolean(task.submission_file_url))
+      .sort((a, b) => {
+        const aTime = getTaskHistoryDate(a);
+        const bTime = getTaskHistoryDate(b);
+        return new Date(bTime || 0).getTime() - new Date(aTime || 0).getTime();
+      })
+      .filter((task) => {
+        if (!term) return true;
+        const leaderName = getHistoryPersonName(
+          task.created_by,
+          members,
+          leaders,
+          currentUser?.id,
+          profile?.full_name
+        );
+        const executorName = task.assignee_id
+          ? getHistoryPersonName(
+              task.assignee_id,
+              members,
+              leaders,
+              currentUser?.id,
+              profile?.full_name
+            )
+          : 'Seluruh Tim';
+        return [
+          task.title,
+          task.description,
+          task.instruction_file_name,
+          task.submission_file_name,
+          leaderName,
+          executorName,
+        ]
+          .filter(Boolean)
+          .some((value) => value?.toLowerCase().includes(term));
+      });
+  }, [currentUser?.id, historySearch, leaders, members, profile?.full_name, visibleTasks]);
+  const historyEvents = useMemo(() => {
+    const term = historySearch.trim().toLowerCase();
+    return [...events]
+      .sort(
+        (a, b) => new Date(b.start_time).getTime() - new Date(a.start_time).getTime()
+      )
+      .filter((event) => {
+        if (!term) return true;
+        const organizerName = getHistoryPersonName(
+          event.created_by,
+          members,
+          leaders,
+          currentUser?.id,
+          profile?.full_name
+        );
+        const meetingType = isOnlineEvent(event) ? 'rapat online' : 'rapat offline';
+        return [event.title, event.location, organizerName, meetingType]
+          .filter(Boolean)
+          .some((value) => value?.toLowerCase().includes(term));
+      });
+  }, [currentUser?.id, events, historySearch, leaders, members, profile?.full_name]);
+
   const upcomingEvents = useMemo(
     () => events.filter((event) => new Date(event.end_time).getTime() >= currentTime),
+    [currentTime, events]
+  );
+  const upcomingAgendaEvents = useMemo(
+    () =>
+      events
+        .filter((event) => new Date(event.start_time).getTime() >= currentTime)
+        .sort(
+          (a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
+        ),
     [currentTime, events]
   );
   const activeMeetings = useMemo(() => {
     return events.filter(
       (event) =>
-        Boolean(event.meeting_room_id) &&
+        isOnlineEvent(event) &&
         new Date(event.start_time).getTime() <= currentTime &&
         new Date(event.end_time).getTime() >= currentTime
     );
@@ -979,42 +1135,117 @@ export default function App() {
     }
   };
 
+  const resetEventForm = () => {
+    setEditingEventId(null);
+    setNewEventTitle('');
+    setNewEventDate('');
+    setNewEventMeetingType('online');
+    setNewEventLocation('');
+  };
+
+  const startEditingEvent = (event: TeamEvent) => {
+    setEditingEventId(event.id);
+    setNewEventTitle(event.title);
+    setNewEventDate(toDateTimeLocalValue(event.start_time));
+    setNewEventMeetingType(isOnlineEvent(event) ? 'online' : 'offline');
+    setNewEventLocation(event.location || '');
+    setNotice('');
+  };
+
   const handleAddEvent = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!newEventTitle.trim() || !newEventDate || !workspace || !session?.user) return;
-    const start = new Date(newEventDate);
-    const end = new Date(start.getTime() + 60 * 60 * 1000);
-    setBusy(true);
-    const { data, error } = await supabase
-      .from('events')
-      .insert({
-        workspace_id: workspace.id,
-        title: newEventTitle.trim(),
-        start_time: start.toISOString(),
-        end_time: end.toISOString(),
-        meeting_room_id: `teamhub-${crypto.randomUUID().slice(0, 10)}`,
-        created_by: session.user.id,
-      })
-      .select()
-      .single();
-    setBusy(false);
-    if (error) {
-      showError(`Jadwal tidak dapat dibuat: ${error.message}`);
+    if (newEventMeetingType === 'offline' && !newEventLocation.trim()) {
+      showError('Tempat / Lokasi Rapat wajib diisi untuk rapat offline.');
       return;
     }
+    const start = new Date(newEventDate);
+    const end = new Date(start.getTime() + 60 * 60 * 1000);
+    const existingEvent = events.find((item) => item.id === editingEventId);
+    if (editingEventId && !existingEvent) {
+      showError('Agenda yang akan diedit tidak ditemukan.');
+      return;
+    }
+    const eventValues = {
+      title: newEventTitle.trim(),
+      start_time: start.toISOString(),
+      end_time: end.toISOString(),
+      meeting_type: newEventMeetingType,
+      location: newEventMeetingType === 'offline' ? newEventLocation.trim() : null,
+      meeting_room_id:
+        newEventMeetingType === 'online'
+          ? existingEvent?.meeting_room_id || `teamhub-${crypto.randomUUID().slice(0, 10)}`
+          : null,
+    };
+    const wasEditing = Boolean(editingEventId);
+    setBusy(true);
+    const request = editingEventId
+      ? supabase
+          .from('events')
+          .update(eventValues)
+          .eq('id', editingEventId)
+          .eq('workspace_id', workspace.id)
+          .select()
+          .single()
+      : supabase
+          .from('events')
+          .insert({ ...eventValues, workspace_id: workspace.id, created_by: session.user.id })
+          .select()
+          .single();
+    const { data, error } = await request;
+    setBusy(false);
+    if (error) {
+      showError(
+        wasEditing
+          ? `Jadwal tidak dapat diperbarui: ${error.message}`
+          : `Jadwal tidak dapat dibuat: ${error.message}`
+      );
+      return;
+    }
+    const savedEvent = data as TeamEvent;
     setEvents((previous) =>
-      [...previous, data as TeamEvent].sort(
+      [...previous.filter((item) => item.id !== savedEvent.id), savedEvent].sort(
         (a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
       )
     );
-    setNewEventTitle('');
-    setNewEventDate('');
+    resetEventForm();
+    if (wasEditing) {
+      showSuccess('Jadwal berhasil diperbarui.');
+      return;
+    }
+    const meetingDetails =
+      newEventMeetingType === 'online'
+        ? 'Rapat Online'
+        : `Rapat Offline di ${newEventLocation.trim()}`;
     const notificationSaved = await recordActivityNotification(
       'event_created',
-      'Jadwal baru dibuat',
-      `${data.title} dijadwalkan pada ${start.toLocaleString('id-ID')}.`
+      `${meetingDetails} dijadwalkan`,
+      `${savedEvent.title} — ${meetingDetails}, ${start.toLocaleString('id-ID')}.`
     );
     if (notificationSaved) showSuccess('Jadwal rapat dan notifikasi berhasil disimpan.');
+  };
+
+  const deleteEvent = async (event: TeamEvent) => {
+    const confirmed = window.confirm(
+      `Hapus agenda "${event.title}"? Tindakan ini tidak dapat dibatalkan.`
+    );
+    if (!confirmed || !workspace) return;
+    setBusy(true);
+    const { error } = await supabase
+      .from('events')
+      .delete()
+      .eq('id', event.id)
+      .eq('workspace_id', workspace.id)
+      .select('id')
+      .single();
+    setBusy(false);
+    if (error) {
+      showError(`Agenda tidak dapat dihapus: ${error.message}`);
+      return;
+    }
+    setEvents((previous) => previous.filter((item) => item.id !== event.id));
+    if (editingEventId === event.id) resetEventForm();
+    showSuccess('Agenda berhasil dihapus.');
   };
 
   const createInstantMeeting = async () => {
@@ -1030,6 +1261,8 @@ export default function App() {
         title: `Rapat instan - ${profile?.full_name || session.user.email || 'Tim'}`,
         start_time: start.toISOString(),
         end_time: end.toISOString(),
+        meeting_type: 'online',
+        location: null,
         meeting_room_id: roomId,
         created_by: session.user.id,
       })
@@ -1499,11 +1732,11 @@ export default function App() {
       : navigation.find((item) => item.id === activeTab)?.label ?? 'Team-Hub';
 
   return (
-    <div className="flex h-screen min-h-[600px] overflow-hidden bg-slate-950 text-slate-100">
+    <div className="flex h-[100dvh] min-h-0 overflow-hidden bg-slate-950 text-slate-100">
       <aside
-        className={`flex shrink-0 flex-col border-r border-slate-800 bg-slate-900 transition-[width] duration-200 ${
-          collapsed ? 'w-[76px]' : 'w-[272px]'
-        }`}
+        className={`fixed inset-y-0 left-0 z-50 flex w-[min(85vw,272px)] flex-col border-r border-slate-800 bg-slate-900 transition-transform duration-200 md:static md:z-auto md:w-auto md:shrink-0 md:translate-x-0 md:transition-[width] ${
+          mobileDrawerOpen ? 'translate-x-0' : '-translate-x-full'
+        } ${collapsed ? 'md:w-[76px]' : 'md:w-[272px]'}`}
       >
         <div className={`flex h-16 items-center ${collapsed ? 'justify-center px-2' : 'justify-between px-4'}`}>
           <button
@@ -1521,13 +1754,21 @@ export default function App() {
             <button
               type="button"
               onClick={() => setCollapsed(true)}
-              className="rounded-lg p-2 text-slate-500 transition hover:bg-slate-800 hover:text-slate-200"
+              className="hidden rounded-lg p-2 text-slate-500 transition hover:bg-slate-800 hover:text-slate-200 md:block"
               title="Ciutkan sidebar"
               aria-label="Ciutkan sidebar"
             >
               <ChevronLeft className="h-4 w-4" />
             </button>
           )}
+          <button
+            type="button"
+            onClick={() => setMobileDrawerOpen(false)}
+            className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 md:hidden"
+            aria-label="Tutup menu"
+          >
+            <X className="h-4 w-4" />
+          </button>
           {collapsed && (
             <button
               type="button"
@@ -1575,7 +1816,7 @@ export default function App() {
               aria-expanded={showCreateMenu}
             >
               <Plus className="h-4 w-4 shrink-0" />
-              {!collapsed && <span>Notulensi Baru</span>}
+              {!collapsed && <span>Tambah +</span>}
             </button>
             {showCreateMenu && (
               <div className="absolute left-0 top-full z-30 mt-2 w-52 rounded-xl border border-slate-700 bg-slate-800 p-1.5 shadow-2xl">
@@ -1632,7 +1873,9 @@ export default function App() {
                       ? upcomingEvents.length
                       : id === 'docs'
                         ? documents.length
-                        : unreadNotificationCount;
+                        : id === 'history'
+                          ? 0
+                          : unreadNotificationCount;
             return (
               <React.Fragment key={id}>
                 <button
@@ -1666,6 +1909,19 @@ export default function App() {
             );
           })}
         </nav>
+
+        {installPrompt && (
+          <div className="shrink-0 px-3 pb-3">
+            <button
+              type="button"
+              onClick={() => void installApplication()}
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-indigo-400/25 bg-indigo-500/10 px-3 py-2.5 text-xs font-medium text-indigo-200 transition hover:bg-indigo-500/20"
+            >
+              <Download className="h-4 w-4 shrink-0" />
+              {!collapsed && 'Install Aplikasi'}
+            </button>
+          </div>
+        )}
 
         <div className={`shrink-0 border-t border-slate-800 p-3 ${collapsed ? 'space-y-2' : 'space-y-3'}`}>
           <div className="flex items-center gap-2">
@@ -1737,16 +1993,35 @@ export default function App() {
           </div>
         </div>
       </aside>
+      {mobileDrawerOpen && (
+        <button
+          type="button"
+          onClick={() => setMobileDrawerOpen(false)}
+          aria-label="Tutup menu navigasi"
+          className="fixed inset-0 z-40 bg-slate-950/70 backdrop-blur-sm md:hidden"
+        />
+      )}
 
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-16 shrink-0 items-center justify-between border-b border-slate-800 bg-slate-950/90 px-4 sm:px-7">
           <div className="flex min-w-0 items-center gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                setCollapsed(false);
+                setMobileDrawerOpen(true);
+              }}
+              aria-label="Buka menu navigasi"
+              className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-slate-100 md:hidden"
+            >
+              <Menu className="h-4 w-4" />
+            </button>
             {collapsed && (
               <button
                 type="button"
                 onClick={() => setCollapsed(false)}
                 aria-label="Perluas sidebar"
-                className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                className="hidden rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-slate-100 md:block"
               >
                 <Menu className="h-4 w-4" />
               </button>
@@ -1990,7 +2265,7 @@ export default function App() {
                 <h2 className="mb-3 text-sm font-semibold text-slate-200">Rapat terjadwal</h2>
                 <div className="space-y-2">
                   {upcomingEvents
-                    .filter((event) => event.meeting_room_id)
+                    .filter(isOnlineEvent)
                     .filter(
                       (event) =>
                         !activeMeetings.some((activeMeeting) => activeMeeting.id === event.id)
@@ -2000,7 +2275,7 @@ export default function App() {
                     </div>
                   ) : (
                     upcomingEvents
-                      .filter((event) => event.meeting_room_id)
+                      .filter(isOnlineEvent)
                       .filter(
                         (event) =>
                           !activeMeetings.some((activeMeeting) => activeMeeting.id === event.id)
@@ -2044,30 +2319,77 @@ export default function App() {
               </div>
               <form
                 onSubmit={handleAddEvent}
-                className="mb-7 grid gap-2 rounded-xl border border-slate-800 bg-slate-900 p-4 sm:grid-cols-[1fr_auto_auto]"
+                className="mb-7 grid gap-3 rounded-xl border border-slate-800 bg-slate-900 p-4 sm:grid-cols-2"
               >
                 <input
                   value={newEventTitle}
                   onChange={(event) => setNewEventTitle(event.target.value)}
                   aria-label="Nama rapat"
                   placeholder="Nama rapat atau acara"
-                  className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-200 outline-none focus:border-indigo-500"
+                  className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-200 outline-none focus:border-indigo-500"
                 />
                 <input
                   type="datetime-local"
                   value={newEventDate}
                   onChange={(event) => setNewEventDate(event.target.value)}
                   aria-label="Waktu rapat"
-                  className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-300 outline-none focus:border-indigo-500"
+                  className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-300 outline-none focus:border-indigo-500"
                 />
-                <button
-                  type="submit"
-                  disabled={busy || !newEventTitle.trim() || !newEventDate}
-                  className="flex items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+                <select
+                  value={newEventMeetingType}
+                  onChange={(event) =>
+                    setNewEventMeetingType(
+                      event.target.value === 'offline' ? 'offline' : 'online'
+                    )
+                  }
+                  aria-label="Tipe rapat"
+                  className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-300 outline-none focus:border-indigo-500"
                 >
-                  <Plus className="h-4 w-4" />
-                  Jadwalkan
-                </button>
+                  <option value="online">Rapat Online</option>
+                  <option value="offline">Rapat Offline / Tatap Muka</option>
+                </select>
+                {newEventMeetingType === 'offline' && (
+                  <label className="block text-xs text-slate-400">
+                    Tempat / Lokasi Rapat
+                    <input
+                      value={newEventLocation}
+                      onChange={(event) => setNewEventLocation(event.target.value)}
+                      aria-label="Tempat / Lokasi Rapat"
+                      placeholder="Contoh: Aula Kantor"
+                      required
+                      className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-200 outline-none focus:border-indigo-500"
+                    />
+                  </label>
+                )}
+                <div className="flex justify-end gap-2 sm:col-span-2">
+                  {editingEventId && (
+                    <button
+                      type="button"
+                      onClick={resetEventForm}
+                      disabled={busy}
+                      className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+                    >
+                      Batal
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={
+                      busy ||
+                      !newEventTitle.trim() ||
+                      !newEventDate ||
+                      (newEventMeetingType === 'offline' && !newEventLocation.trim())
+                    }
+                    className="flex items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+                  >
+                    {editingEventId ? (
+                      <Check className="h-4 w-4" />
+                    ) : (
+                      <Plus className="h-4 w-4" />
+                    )}
+                    {editingEventId ? 'Simpan Perubahan' : 'Jadwalkan'}
+                  </button>
+                </div>
               </form>
               <div className="space-y-3">
                 {upcomingEvents.length === 0 ? (
@@ -2080,10 +2402,12 @@ export default function App() {
                   upcomingEvents.map((event) => (
                     <article
                       key={event.id}
-                      className="flex items-start gap-4 rounded-xl border border-slate-800 bg-slate-900 p-4"
+                      className="flex flex-col items-start gap-4 rounded-xl border border-slate-800 bg-slate-900 p-4 sm:flex-row"
                     >
                       <div className="rounded-lg bg-indigo-500/10 p-2.5 text-indigo-300">
-                        {event.meeting_room_id ? (
+                        {event.meeting_type === 'offline' ? (
+                          <MapPin className="h-5 w-5" />
+                        ) : isOnlineEvent(event) ? (
                           <Video className="h-5 w-5" />
                         ) : (
                           <CalendarDays className="h-5 w-5" />
@@ -2098,20 +2422,52 @@ export default function App() {
                             timeStyle: 'short',
                           })}
                         </p>
-                        {event.meeting_room_id && (
-                          <p className="mt-2 text-[11px] text-slate-600">Rapat video Jitsi</p>
+                        {isOnlineEvent(event) && (
+                          <p className="mt-2 text-[11px] text-slate-400">Rapat Video Online</p>
+                        )}
+                        {event.meeting_type === 'offline' && (
+                          <p className="mt-2 flex items-center gap-1.5 text-xs text-slate-300">
+                            <MapPin className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                            Tempat: {event.location || 'Belum ditentukan'}
+                          </p>
                         )}
                       </div>
-                      {event.meeting_room_id && (
-                        <a
-                          href={getMeetingLink(event)}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="shrink-0 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
+                      <div className="flex w-full shrink-0 items-center justify-end gap-2 sm:w-auto">
+                        {isOnlineEvent(event) ? (
+                          <a
+                            href={getMeetingLink(event)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
+                          >
+                            Gabung
+                          </a>
+                        ) : event.meeting_type === 'offline' ? (
+                          <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] font-medium text-amber-200">
+                            Tatap Muka / Offline
+                          </span>
+                        ) : null}
+                        <button
+                          type="button"
+                          onClick={() => startEditingEvent(event)}
+                          disabled={busy}
+                          title="Edit agenda"
+                          aria-label={`Edit agenda ${event.title}`}
+                          className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-50"
                         >
-                          Gabung
-                        </a>
-                      )}
+                          <Pencil className="h-4 w-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void deleteEvent(event)}
+                          disabled={busy}
+                          title="Hapus agenda"
+                          aria-label={`Hapus agenda ${event.title}`}
+                          className="rounded-lg p-2 text-red-400 transition hover:bg-red-500/10 hover:text-red-300 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
                     </article>
                   ))
                 )}
@@ -2234,7 +2590,7 @@ export default function App() {
                   </form>
                 )}
               </div>
-              <div className="grid gap-4 lg:grid-cols-3">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
                 {taskColumns.map((column) => {
                   const columnTasks = filteredTasks.filter((task) => task.status === column.status);
                   return (
@@ -2369,7 +2725,11 @@ export default function App() {
 
           {activeTab === 'docs' && (
             <section className="flex min-h-full">
-              <aside className="hidden w-64 shrink-0 border-r border-slate-800 bg-slate-950/50 p-4 sm:block">
+              <aside
+                className={`w-full shrink-0 border-r border-slate-800 bg-slate-950/50 p-4 sm:w-64 ${
+                  selectedDocument ? 'hidden sm:block' : 'block'
+                }`}
+              >
                 <div className="mb-4 flex items-center justify-between">
                   <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                     Daftar Notulensi
@@ -2441,12 +2801,24 @@ export default function App() {
                   )}
                 </div>
               </aside>
-              <div className="flex min-w-0 flex-1 flex-col">
+              <div
+                className={`min-w-0 flex-1 flex-col ${
+                  selectedDocument ? 'flex' : 'hidden sm:flex'
+                }`}
+              >
                 {selectedDocument ? (
                   <>
                     <form onSubmit={handleSaveDocument} className="flex flex-col">
                       <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-4 py-3 sm:px-8">
                         <div className="min-w-0 flex-1">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedDocumentId(null)}
+                            className="mb-2 inline-flex items-center gap-1 text-[11px] text-indigo-300 hover:text-indigo-200 sm:hidden"
+                          >
+                            <ChevronLeft className="h-3.5 w-3.5" />
+                            Daftar Notulensi
+                          </button>
                           <input
                             value={documentTitle}
                             onChange={(event) => setDocumentTitle(event.target.value)}
@@ -2582,6 +2954,248 @@ export default function App() {
                   </div>
                 )}
               </div>
+            </section>
+          )}
+
+          {activeTab === 'history' && (
+            <section className="mx-auto max-w-6xl p-5 sm:p-8">
+              <div className="mb-6">
+                <div className="flex items-center gap-3">
+                  <div className="rounded-xl bg-indigo-500/10 p-2.5 text-indigo-300">
+                    <History className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-lg font-semibold">History Tim</h2>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Arsip tugas, dokumen hasil, dan riwayat rapat workspace.
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { id: 'all', label: 'Semua Aktivitas' },
+                    { id: 'tasks', label: 'Tugas Selesai & Dokumen' },
+                    { id: 'meetings', label: 'Riwayat Rapat' },
+                  ].map((filter) => (
+                    <button
+                      key={filter.id}
+                      type="button"
+                      onClick={() => setHistoryFilter(filter.id as HistoryFilter)}
+                      className={`rounded-lg px-3 py-2 text-xs font-medium transition ${
+                        historyFilter === filter.id
+                          ? 'bg-indigo-500/15 text-indigo-200'
+                          : 'border border-slate-800 text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+                      }`}
+                    >
+                      {filter.label}
+                    </button>
+                  ))}
+                </div>
+                <label className="relative block w-full sm:max-w-xs">
+                  <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
+                  <input
+                    type="search"
+                    value={historySearch}
+                    onChange={(event) => setHistorySearch(event.target.value)}
+                    aria-label="Cari history berdasarkan judul atau nama anggota"
+                    placeholder="Cari judul atau nama anggota..."
+                    className="w-full rounded-lg border border-slate-800 bg-slate-900 py-2.5 pl-9 pr-3 text-xs text-slate-200 outline-none placeholder:text-slate-600 focus:border-indigo-500"
+                  />
+                </label>
+              </div>
+
+              {historyFilter !== 'meetings' && (
+                <section className="mb-8">
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <h3 className="text-sm font-semibold text-slate-200">
+                      Arsip Tugas Selesai & Dokumen
+                    </h3>
+                    <span className="text-[11px] text-slate-500">
+                      {historyTasks.length} tugas
+                    </span>
+                  </div>
+                  {historyTasks.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-slate-800 p-8 text-center">
+                      <CheckSquare className="mx-auto mb-2 h-6 w-6 text-slate-700" />
+                      <p className="text-xs text-slate-500">Tidak ada arsip tugas yang cocok.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {historyTasks.map((task) => {
+                        const taskDate = getTaskHistoryDate(task);
+                        const leaderName = getHistoryPersonName(
+                          task.created_by,
+                          members,
+                          leaders,
+                          currentUser?.id,
+                          profile?.full_name
+                        );
+                        const executorName = task.assignee_id
+                          ? getHistoryPersonName(
+                              task.assignee_id,
+                              members,
+                              leaders,
+                              currentUser?.id,
+                              profile?.full_name
+                            )
+                          : 'Seluruh Tim';
+                        return (
+                          <article
+                            key={task.id}
+                            className="rounded-xl border border-slate-800 bg-slate-900 p-4 sm:p-5"
+                          >
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <h4 className="text-sm font-semibold text-slate-100">
+                                  {task.title}
+                                </h4>
+                                <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-slate-400">
+                                  {task.description || 'Tidak ada detail perintah tugas.'}
+                                </p>
+                              </div>
+                              <span className="shrink-0 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-medium text-emerald-300">
+                                {task.status === 'done' ? 'Selesai' : 'Hasil dikirim'}
+                              </span>
+                            </div>
+                            <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 border-t border-slate-800 pt-3 text-[11px] text-slate-400">
+                              <span className="inline-flex items-center gap-1.5">
+                                <Clock3 className="h-3.5 w-3.5 text-slate-500" />
+                                Selesai:{' '}
+                                {taskDate
+                                  ? new Date(taskDate).toLocaleString('id-ID', {
+                                      dateStyle: 'medium',
+                                      timeStyle: 'short',
+                                    })
+                                  : 'Tanggal tidak tersedia'}
+                              </span>
+                              <span>
+                                Leader pemberi tugas: <strong className="font-medium text-slate-300">{leaderName}</strong>
+                              </span>
+                              <span>
+                                Pelaksana: <strong className="font-medium text-slate-300">{executorName}</strong>
+                              </span>
+                            </div>
+                            {(task.instruction_file_url || task.submission_file_url) && (
+                              <div className="mt-4 flex flex-wrap gap-2">
+                                {task.instruction_file_url && (
+                                  <a
+                                    href={task.instruction_file_url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    download={task.instruction_file_name || true}
+                                    className="inline-flex items-center gap-2 rounded-lg border border-indigo-500/25 bg-indigo-500/10 px-3 py-2 text-[11px] font-medium text-indigo-200 transition hover:bg-indigo-500/20"
+                                  >
+                                    <Download className="h-3.5 w-3.5" />
+                                    📄 Dokumen Tugas (Leader)
+                                  </a>
+                                )}
+                                {task.submission_file_url && (
+                                  <a
+                                    href={task.submission_file_url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    download={task.submission_file_name || true}
+                                    className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-[11px] font-medium text-emerald-200 transition hover:bg-emerald-500/20"
+                                  >
+                                    <Download className="h-3.5 w-3.5" />
+                                    ✅ Dokumen Hasil (Member/Leader)
+                                  </a>
+                                )}
+                              </div>
+                            )}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              )}
+
+              {historyFilter !== 'tasks' && (
+                <section>
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <h3 className="text-sm font-semibold text-slate-200">Riwayat Rapat</h3>
+                    <span className="text-[11px] text-slate-500">
+                      {historyEvents.length} agenda
+                    </span>
+                  </div>
+                  {historyEvents.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-slate-800 p-8 text-center">
+                      <CalendarDays className="mx-auto mb-2 h-6 w-6 text-slate-700" />
+                      <p className="text-xs text-slate-500">Tidak ada riwayat rapat yang cocok.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {historyEvents.map((event) => {
+                        const online = isOnlineEvent(event);
+                        const eventType = online
+                          ? 'Rapat Online'
+                          : event.meeting_type === 'offline'
+                            ? 'Rapat Offline'
+                            : 'Agenda Tim';
+                        const organizer = getHistoryPersonName(
+                          event.created_by,
+                          members,
+                          leaders,
+                          currentUser?.id,
+                          profile?.full_name
+                        );
+                        return (
+                          <article
+                            key={event.id}
+                            className="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-900 p-4"
+                          >
+                            <div className="rounded-lg bg-indigo-500/10 p-2 text-indigo-300">
+                              {online ? (
+                                <Video className="h-4 w-4" />
+                              ) : event.meeting_type === 'offline' ? (
+                                <MapPin className="h-4 w-4" />
+                              ) : (
+                                <CalendarDays className="h-4 w-4" />
+                              )}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <h4 className="text-sm font-medium text-slate-100">{event.title}</h4>
+                              <p className="mt-1 text-xs text-slate-400">
+                                {new Date(event.start_time).toLocaleDateString('id-ID', {
+                                  dateStyle: 'medium',
+                                })}{' '}
+                                ·{' '}
+                                {new Date(event.start_time).toLocaleTimeString('id-ID', {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}{' '}
+                                –{' '}
+                                {new Date(event.end_time).toLocaleTimeString('id-ID', {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}
+                              </p>
+                              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
+                                <span
+                                  className={`rounded-full px-2 py-0.5 ${
+                                    online
+                                      ? 'bg-indigo-500/10 text-indigo-300'
+                                      : event.meeting_type === 'offline'
+                                        ? 'bg-amber-500/10 text-amber-200'
+                                        : 'bg-slate-800 text-slate-400'
+                                  }`}
+                                >
+                                  {eventType}
+                                </span>
+                                {event.location && <span>Tempat: {event.location}</span>}
+                                <span>Penjadwal: {organizer}</span>
+                              </div>
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              )}
             </section>
           )}
 
@@ -2732,6 +3346,55 @@ export default function App() {
 
           {activeTab === 'inbox' && (
             <section className="mx-auto max-w-4xl p-5 sm:p-8">
+              <div className="mb-7 rounded-xl border border-slate-800 bg-slate-900 p-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <h2 className="text-sm font-semibold text-slate-200">Agenda Mendatang</h2>
+                  <span className="text-[11px] text-slate-500">
+                    {upcomingAgendaEvents.length} agenda
+                  </span>
+                </div>
+                {upcomingAgendaEvents.length === 0 ? (
+                  <p className="rounded-lg border border-dashed border-slate-800 px-4 py-6 text-center text-xs text-slate-500">
+                    Belum ada jadwal mendatang.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {upcomingAgendaEvents.map((event) => (
+                      <article
+                        key={event.id}
+                        className="flex items-start gap-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3"
+                      >
+                        <div className="mt-0.5 rounded-lg bg-indigo-500/10 p-2 text-indigo-300">
+                          {isOnlineEvent(event) ? (
+                            <Video className="h-4 w-4" />
+                          ) : event.meeting_type === 'offline' ? (
+                            <MapPin className="h-4 w-4" />
+                          ) : (
+                            <CalendarDays className="h-4 w-4" />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-xs font-medium text-slate-200">{event.title}</p>
+                          <p className="mt-1 flex items-center gap-1.5 text-[11px] text-slate-400">
+                            <Clock3 className="h-3 w-3 shrink-0" />
+                            {new Date(event.start_time).toLocaleString('id-ID', {
+                              dateStyle: 'medium',
+                              timeStyle: 'short',
+                            })}
+                          </p>
+                          {isOnlineEvent(event) ? (
+                            <p className="mt-1 text-[11px] text-indigo-300">Rapat Online</p>
+                          ) : event.meeting_type === 'offline' ? (
+                            <p className="mt-1 text-[11px] text-slate-300">
+                              Rapat Offline · {event.location || 'Lokasi belum ditentukan'}
+                            </p>
+                          ) : null}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </div>
               <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
                 <div>
                   <h2 className="text-lg font-semibold">Notifikasi aktivitas tim</h2>
