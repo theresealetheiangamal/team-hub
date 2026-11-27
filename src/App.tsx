@@ -17,6 +17,7 @@ import {
   FileUp,
   FileText,
   History,
+  LayoutDashboard,
   LogOut,
   MapPin,
   Menu,
@@ -42,6 +43,7 @@ type Tab =
   | 'messages'
   | 'meetings'
   | 'calendar'
+  | 'dashboard'
   | 'tasks'
   | 'docs'
   | 'history'
@@ -89,6 +91,7 @@ type WorkspaceMember = {
   full_name: string;
   role: string;
   leader_id?: string | null;
+  status?: string | null;
 };
 type TeamEvent = {
   id: string;
@@ -134,6 +137,7 @@ type BeforeInstallPromptEvent = Event & {
 };
 
 const navigation: { id: Tab; label: string; icon: LucideIcon }[] = [
+  { id: 'dashboard', label: 'Beranda', icon: LayoutDashboard },
   { id: 'messages', label: 'Pesan', icon: MessageSquare },
   { id: 'meetings', label: 'Rapat Video', icon: Video },
   { id: 'calendar', label: 'Kalender', icon: CalendarDays },
@@ -193,11 +197,17 @@ function toDateTimeLocalValue(value: string) {
     .slice(0, 16);
 }
 
+function csvCell(value: string | null | undefined) {
+  const text = value ?? '';
+  const safeText = /^[\s]*[=+\-@]/.test(text) ? `'${text}` : text;
+  return `"${safeText.replace(/"/g, '""')}"`;
+}
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [currentTime, setCurrentTime] = useState(() => Date.now());
-  const [activeTab, setActiveTab] = useState<Tab>('messages');
+  const [activeTab, setActiveTab] = useState<Tab>('dashboard');
   const [collapsed, setCollapsed] = useState(false);
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
@@ -319,6 +329,7 @@ export default function App() {
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       setSession(nextSession);
       setLoading(false);
+      if (_event === 'SIGNED_IN') setActiveTab('dashboard');
       if (!nextSession) {
         setWorkspace(null);
         setProfile(null);
@@ -505,7 +516,7 @@ export default function App() {
     } else if (membershipRows?.length) {
       const { data: profileRows, error: membersProfileError } = await supabase
         .from('profiles')
-        .select('id, full_name, role, leader_id')
+        .select('id, full_name, role, leader_id, status')
         .in('id', membershipRows.map((member) => member.user_id));
       if (membersProfileError) {
         showError(`Profil anggota tidak dapat dimuat: ${membersProfileError.message}`);
@@ -521,12 +532,15 @@ export default function App() {
           leader_id:
             profileRows?.find((profileRecord) => profileRecord.id === member.user_id)
               ?.leader_id || null,
+          status:
+            profileRows?.find((profileRecord) => profileRecord.id === member.user_id)
+              ?.status || null,
         }));
       }
     }
     const { data: assignedProfileRows, error: assignedProfilesError } = await supabase
       .from('profiles')
-      .select('id, full_name, role, leader_id')
+      .select('id, full_name, role, leader_id, status')
       .eq('leader_id', user.id);
     if (assignedProfilesError) {
       showError(`Anggota binaan tidak dapat dimuat: ${assignedProfilesError.message}`);
@@ -541,6 +555,7 @@ export default function App() {
             full_name: member.full_name || 'Anggota',
             role: member.role || 'member',
             leader_id: member.leader_id || null,
+            status: member.status || null,
           })),
       ];
     }
@@ -753,6 +768,32 @@ export default function App() {
       ),
     [currentUser, isWorkspaceLeader, members, profile?.leader_id, tasks]
   );
+  const activeTaskCount = visibleTasks.filter(
+    (task) => task.status === 'todo' || task.status === 'in_progress'
+  ).length;
+  const completedTaskCount = visibleTasks.filter((task) => task.status === 'done').length;
+  const supervisedMembers = useMemo(
+    () =>
+      members.filter(
+        (member) =>
+          member.leader_id === currentUser?.id && member.role.toLowerCase() !== 'leader'
+      ),
+    [currentUser?.id, members]
+  );
+  const memberPriorityTasks = useMemo(
+    () =>
+      visibleTasks
+        .filter((task) => task.status === 'in_progress' || task.status === 'todo')
+        .sort((a, b) => {
+          const statusOrder = { in_progress: 0, todo: 1, done: 2 };
+          return (
+            statusOrder[a.status] - statusOrder[b.status] ||
+            new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+          );
+        })
+        .slice(0, 5),
+    [visibleTasks]
+  );
   const filteredTasks = useMemo(() => {
     const term = search.trim().toLowerCase();
     return term
@@ -831,6 +872,92 @@ export default function App() {
           .some((value) => value?.toLowerCase().includes(term));
       });
   }, [currentUser?.id, events, historySearch, leaders, members, profile?.full_name]);
+
+  const downloadHistoryCsv = () => {
+    const taskRows =
+      historyFilter === 'meetings'
+        ? []
+        : historyTasks.map((task) => [
+            'Tugas',
+            task.title,
+            task.description || '',
+            getHistoryPersonName(
+              task.created_by,
+              members,
+              leaders,
+              currentUser?.id,
+              profile?.full_name
+            ),
+            task.assignee_id
+              ? getHistoryPersonName(
+                  task.assignee_id,
+                  members,
+                  leaders,
+                  currentUser?.id,
+                  profile?.full_name
+                )
+              : 'Seluruh Tim',
+            getTaskHistoryDate(task)
+              ? new Date(getTaskHistoryDate(task)!).toLocaleString('id-ID')
+              : '',
+            task.status,
+            '',
+            '',
+            task.instruction_file_url || '',
+            task.submission_file_url || '',
+            '',
+          ]);
+    const eventRows =
+      historyFilter === 'tasks'
+        ? []
+        : historyEvents.map((event) => [
+            'Rapat',
+            event.title,
+            '',
+            getHistoryPersonName(
+              event.created_by,
+              members,
+              leaders,
+              currentUser?.id,
+              profile?.full_name
+            ),
+            '',
+            new Date(event.start_time).toLocaleString('id-ID'),
+            '',
+            isOnlineEvent(event) ? 'Online' : event.meeting_type === 'offline' ? 'Offline' : 'Agenda',
+            event.location || '',
+            '',
+            '',
+            isOnlineEvent(event) ? getMeetingLink(event) : '',
+          ]);
+    const rows = [
+      [
+        'Jenis',
+        'Judul',
+        'Deskripsi',
+        'Leader / Penjadwal',
+        'Pelaksana',
+        'Tanggal',
+        'Status',
+        'Tipe Rapat',
+        'Lokasi',
+        'Dokumen Tugas',
+        'Dokumen Hasil',
+        'Link Rapat',
+      ],
+      ...taskRows,
+      ...eventRows,
+    ];
+    const csv = `\uFEFF${rows.map((row) => row.map(csvCell).join(',')).join('\r\n')}`;
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `team-hub-history-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
 
   const upcomingEvents = useMemo(
     () => events.filter((event) => new Date(event.end_time).getTime() >= currentTime),
@@ -1873,9 +2000,9 @@ export default function App() {
                       ? upcomingEvents.length
                       : id === 'docs'
                         ? documents.length
-                        : id === 'history'
-                          ? 0
-                          : unreadNotificationCount;
+                        : id === 'inbox'
+                          ? unreadNotificationCount
+                          : 0;
             return (
               <React.Fragment key={id}>
                 <button
@@ -2091,6 +2218,254 @@ export default function App() {
         )}
 
         <div className="min-h-0 flex-1 overflow-auto">
+          {activeTab === 'dashboard' && (
+            <section className="mx-auto max-w-7xl space-y-6 p-4 sm:p-8">
+              <div>
+                <p className="text-sm font-medium text-indigo-300">
+                  {displayRole === 'leader' ? '👑 Leader' : '👤 Member'}
+                </p>
+                <h2 className="mt-1 text-2xl font-bold tracking-tight text-slate-100 sm:text-3xl">
+                  Selamat datang, {displayName}
+                </h2>
+                <p className="mt-2 text-sm text-slate-400">
+                  Ringkasan aktivitas dan prioritas kerja {workspace?.name || 'tim Anda'}.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <button
+                  type="button"
+                  onClick={() => navigateToTab('tasks')}
+                  className="rounded-xl border border-slate-800 bg-slate-900 p-4 text-left transition hover:border-indigo-500/40 hover:bg-slate-900/80"
+                >
+                  <span className="text-xs text-slate-400">Tugas Aktif</span>
+                  <span className="mt-2 block text-3xl font-semibold text-indigo-300">
+                    {activeTaskCount}
+                  </span>
+                  <span className="mt-1 block text-[11px] text-slate-500">
+                    To Do dan In Progress
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigateToTab('history')}
+                  className="rounded-xl border border-slate-800 bg-slate-900 p-4 text-left transition hover:border-emerald-500/40 hover:bg-slate-900/80"
+                >
+                  <span className="text-xs text-slate-400">Tugas Selesai</span>
+                  <span className="mt-2 block text-3xl font-semibold text-emerald-300">
+                    {completedTaskCount}
+                  </span>
+                  <span className="mt-1 block text-[11px] text-slate-500">Lihat arsip History</span>
+                </button>
+                <div className="min-w-0 rounded-xl border border-slate-800 bg-slate-900 p-4">
+                  <span className="text-xs text-slate-400">Agenda Terdekat</span>
+                  {upcomingAgendaEvents[0] ? (
+                    <>
+                      <span className="mt-2 block truncate text-sm font-semibold text-slate-100">
+                        {upcomingAgendaEvents[0].title}
+                      </span>
+                      <span className="mt-1 block text-[11px] text-slate-400">
+                        {new Date(upcomingAgendaEvents[0].start_time).toLocaleString('id-ID', {
+                          dateStyle: 'medium',
+                          timeStyle: 'short',
+                        })}
+                      </span>
+                      <span className="mt-1 block truncate text-[11px] text-slate-500">
+                        {isOnlineEvent(upcomingAgendaEvents[0])
+                          ? 'Rapat Online'
+                          : upcomingAgendaEvents[0].location || 'Lokasi belum ditentukan'}
+                      </span>
+                      {isOnlineEvent(upcomingAgendaEvents[0]) && (
+                        <a
+                          href={getMeetingLink(upcomingAgendaEvents[0])}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-2 inline-flex items-center gap-1 text-[11px] text-indigo-300 hover:text-indigo-200"
+                        >
+                          <Video className="h-3 w-3" />
+                          Buka ruang rapat
+                        </a>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => navigateToTab('calendar')}
+                        className="mt-2 block text-[11px] text-slate-500 hover:text-slate-300"
+                      >
+                        Lihat kalender
+                      </button>
+                    </>
+                  ) : (
+                    <span className="mt-3 block text-sm text-slate-500">Belum ada agenda.</span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => navigateToTab('docs')}
+                  className="rounded-xl border border-slate-800 bg-slate-900 p-4 text-left transition hover:border-violet-500/40 hover:bg-slate-900/80"
+                >
+                  <span className="text-xs text-slate-400">Total Notulensi</span>
+                  <span className="mt-2 block text-3xl font-semibold text-violet-300">
+                    {documents.length}
+                  </span>
+                  <span className="mt-1 block text-[11px] text-slate-500">Dokumen tersimpan</span>
+                </button>
+              </div>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                <section className="min-w-0 rounded-xl border border-slate-800 bg-slate-900 p-4 sm:p-5">
+                  {isWorkspaceLeader ? (
+                    <>
+                      <div className="mb-4 flex items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-semibold text-slate-100">
+                            Daftar Anggota Binaan
+                          </h3>
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            Member yang dibimbing oleh Anda
+                          </p>
+                        </div>
+                        <UserRound className="h-5 w-5 shrink-0 text-indigo-300" />
+                      </div>
+                      {supervisedMembers.length === 0 ? (
+                        <p className="rounded-lg border border-dashed border-slate-800 p-5 text-center text-xs text-slate-500">
+                          Belum ada Member binaan.
+                        </p>
+                      ) : (
+                        <div className="space-y-2">
+                          {supervisedMembers.map((member) => {
+                            const memberDoneCount = tasks.filter(
+                              (task) =>
+                                task.created_by === currentUser?.id &&
+                                task.status === 'done' &&
+                                (task.target_type === 'personal'
+                                  ? task.assignee_id === member.id
+                                  : task.target_type === 'team')
+                            ).length;
+                            return (
+                              <article
+                                key={member.id}
+                                className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3"
+                              >
+                                <div className="min-w-0">
+                                  <p className="truncate text-xs font-medium text-slate-200">
+                                    {member.full_name}
+                                  </p>
+                                  <p className="mt-1 flex items-center gap-1.5 text-[10px] text-slate-500">
+                                    <span
+                                      className={`h-1.5 w-1.5 rounded-full ${
+                                        member.status === 'Aktif bekerja'
+                                          ? 'bg-emerald-400'
+                                          : member.status === 'Fokus / Rapat'
+                                            ? 'bg-amber-400'
+                                            : 'bg-slate-500'
+                                      }`}
+                                    />
+                                    {member.status || 'Status belum diatur'}
+                                  </p>
+                                </div>
+                                <span className="shrink-0 rounded-md bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-300">
+                                  {memberDoneCount} tugas selesai
+                                </span>
+                              </article>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <div className="mb-4">
+                        <h3 className="text-sm font-semibold text-slate-100">
+                          Leader Pembimbing
+                        </h3>
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          {mentorName || 'Belum ada Leader pembimbing yang ditetapkan.'}
+                        </p>
+                      </div>
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <h4 className="text-xs font-medium text-slate-300">Tugas Prioritas</h4>
+                        <button
+                          type="button"
+                          onClick={() => navigateToTab('tasks')}
+                          className="text-[11px] text-indigo-300 hover:text-indigo-200"
+                        >
+                          Lihat semua
+                        </button>
+                      </div>
+                      {memberPriorityTasks.length === 0 ? (
+                        <p className="rounded-lg border border-dashed border-slate-800 p-5 text-center text-xs text-slate-500">
+                          Tidak ada tugas prioritas saat ini.
+                        </p>
+                      ) : (
+                        <div className="space-y-2">
+                          {memberPriorityTasks.map((task) => (
+                            <button
+                              key={task.id}
+                              type="button"
+                              onClick={() => navigateToTab('tasks')}
+                              className="flex w-full items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-left hover:border-indigo-500/30"
+                            >
+                              <span className="min-w-0 truncate text-xs font-medium text-slate-200">
+                                {task.title}
+                              </span>
+                              <span
+                                className={`shrink-0 rounded-md px-2 py-1 text-[10px] ${
+                                  task.status === 'in_progress'
+                                    ? 'bg-amber-500/10 text-amber-300'
+                                    : 'bg-slate-800 text-slate-400'
+                                }`}
+                              >
+                                {task.status === 'in_progress' ? 'In Progress' : 'To Do'}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </section>
+
+                <section className="rounded-xl border border-slate-800 bg-slate-900 p-4 sm:p-5">
+                  <div className="mb-4 flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-slate-100">Pintasan Cepat</h3>
+                      <p className="mt-1 text-[11px] text-slate-500">Aksi untuk mulai bekerja</p>
+                    </div>
+                    <Sparkles className="h-5 w-5 text-indigo-300" />
+                  </div>
+                  <div className="grid gap-2">
+                    <button
+                      type="button"
+                      onClick={openNewTask}
+                      className="flex items-center gap-2.5 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-3 text-left text-xs font-medium text-slate-200 transition hover:border-indigo-500/40 hover:bg-slate-800"
+                    >
+                      <CheckSquare className="h-4 w-4 text-indigo-300" />
+                      + Buat Tugas
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void createInstantMeeting()}
+                      disabled={busy}
+                      className="flex items-center gap-2.5 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-3 text-left text-xs font-medium text-slate-200 transition hover:border-indigo-500/40 hover:bg-slate-800 disabled:opacity-50"
+                    >
+                      <Video className="h-4 w-4 text-indigo-300" />
+                      Mulai Rapat Video
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void createDocument()}
+                      disabled={busy}
+                      className="flex items-center gap-2.5 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-3 text-left text-xs font-medium text-slate-200 transition hover:border-indigo-500/40 hover:bg-slate-800 disabled:opacity-50"
+                    >
+                      <FileText className="h-4 w-4 text-indigo-300" />
+                      Tulis Notulensi
+                    </button>
+                  </div>
+                </section>
+              </div>
+            </section>
+          )}
+
           {activeTab === 'messages' && (
             <section className="flex h-full min-h-[400px] flex-col">
               <div className="flex-1 space-y-5 overflow-y-auto px-4 py-6 sm:px-8">
@@ -2993,17 +3368,34 @@ export default function App() {
                     </button>
                   ))}
                 </div>
-                <label className="relative block w-full sm:max-w-xs">
-                  <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
-                  <input
-                    type="search"
-                    value={historySearch}
-                    onChange={(event) => setHistorySearch(event.target.value)}
-                    aria-label="Cari history berdasarkan judul atau nama anggota"
-                    placeholder="Cari judul atau nama anggota..."
-                    className="w-full rounded-lg border border-slate-800 bg-slate-900 py-2.5 pl-9 pr-3 text-xs text-slate-200 outline-none placeholder:text-slate-600 focus:border-indigo-500"
-                  />
-                </label>
+                <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
+                  <label className="relative block min-w-0 flex-1 sm:w-64">
+                    <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
+                    <input
+                      type="search"
+                      value={historySearch}
+                      onChange={(event) => setHistorySearch(event.target.value)}
+                      aria-label="Cari history berdasarkan judul atau nama anggota"
+                      placeholder="Cari judul atau nama anggota..."
+                      className="w-full rounded-lg border border-slate-800 bg-slate-900 py-2.5 pl-9 pr-3 text-xs text-slate-200 outline-none placeholder:text-slate-600 focus:border-indigo-500"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={downloadHistoryCsv}
+                    disabled={
+                      historyFilter === 'meetings'
+                        ? historyEvents.length === 0
+                        : historyFilter === 'tasks'
+                          ? historyTasks.length === 0
+                          : historyTasks.length === 0 && historyEvents.length === 0
+                    }
+                    className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <Download className="h-4 w-4" />
+                    📥 Unduh Laporan (.CSV)
+                  </button>
+                </div>
               </div>
 
               {historyFilter !== 'meetings' && (
