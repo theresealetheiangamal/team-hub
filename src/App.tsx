@@ -25,6 +25,7 @@ import {
   MoreHorizontal,
   Pencil,
   Plus,
+  Printer,
   RotateCcw,
   Search,
   Send,
@@ -1830,6 +1831,83 @@ export default function App() {
       setSelectedRevisionId(savedRevision.id);
     }
     showSuccess('Notulensi berhasil disimpan.');
+  };
+
+  const printDocument = () => {
+    if (!selectedDocument) return;
+
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+      showError('Jendela cetak diblokir browser. Izinkan pop-up lalu coba lagi.');
+      return;
+    }
+
+    const escapeHtml = (value: string) =>
+      value.replace(/[&<>"']/g, (character) => {
+        const entities: Record<string, string> = {
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#39;',
+        };
+        return entities[character];
+      });
+    const updatedAt = selectedDocument.updated_at
+      ? new Date(selectedDocument.updated_at)
+      : new Date();
+    const authorName = profile?.full_name || session?.user.email || 'Anggota Team-Hub';
+
+    printWindow.document.open();
+    printWindow.document.write(`<!doctype html>
+      <html lang="id">
+        <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>${escapeHtml(documentTitle.trim() || 'Tanpa judul')} — Team-Hub</title>
+          <style>
+            @page { margin: 22mm 20mm; }
+            * { box-sizing: border-box; }
+            body {
+              margin: 0;
+              color: #111827;
+              background: #fff;
+              font-family: Arial, Helvetica, sans-serif;
+              font-size: 12pt;
+              line-height: 1.65;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+            main { max-width: 800px; margin: 0 auto; }
+            h1 {
+              margin: 0 0 20px;
+              font-size: 15pt;
+              letter-spacing: .04em;
+              text-align: center;
+            }
+            h2 { margin: 0 0 10px; font-size: 19pt; }
+            .meta { margin: 0; color: #374151; font-size: 10pt; }
+            hr { margin: 22px 0; border: 0; border-top: 1px solid #9ca3af; }
+            article { white-space: pre-wrap; overflow-wrap: anywhere; }
+          </style>
+        </head>
+        <body>
+          <main>
+            <h1>NOTULENSI RAPAT / CATATAN KERJA — TEAM-HUB</h1>
+            <h2>${escapeHtml(documentTitle.trim() || 'Tanpa judul')}</h2>
+            <p class="meta">Tanggal pembaruan: ${escapeHtml(updatedAt.toLocaleString('id-ID'))}</p>
+            <p class="meta">Penyusun: ${escapeHtml(authorName)}</p>
+            <hr />
+            <article>${escapeHtml(documentContent)}</article>
+          </main>
+          <script>
+            window.addEventListener('load', () => {
+              window.setTimeout(() => window.print(), 150);
+            });
+          </script>
+        </body>
+      </html>`);
+    printWindow.document.close();
   };
 
   const restoreDocumentRevision = async (revision: DocumentRevision) => {
@@ -3735,14 +3813,24 @@ export default function App() {
                               : 'Notulensi kolaboratif'}
                           </p>
                         </div>
-                        <button
-                          type="submit"
-                          disabled={busy}
-                          className="flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
-                        >
-                          <Check className="h-3.5 w-3.5" />
-                          Simpan
-                        </button>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={printDocument}
+                            className="flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 transition hover:border-slate-600 hover:bg-slate-800 hover:text-slate-100"
+                          >
+                            <Printer className="h-3.5 w-3.5" />
+                            Cetak / PDF
+                          </button>
+                          <button
+                            type="submit"
+                            disabled={busy}
+                            className="flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                            Simpan
+                          </button>
+                        </div>
                       </div>
                       <textarea
                         value={documentContent}
