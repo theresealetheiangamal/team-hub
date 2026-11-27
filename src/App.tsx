@@ -660,6 +660,35 @@ export default function App() {
     };
   }, [session, workspace]);
 
+  const fetchMessages = useCallback(async (isActive: () => boolean = () => true) => {
+    if (!activeChannel) return;
+
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*, profiles(full_name)')
+      .eq('channel_id', activeChannel.id)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      if (isActive()) showError(`Gagal memuat pesan: ${error.message}`);
+      return;
+    }
+
+    if (data && isActive()) {
+      setMessages((previous) => {
+        const mergedMessages = new Map(
+          (data as TeamMessage[]).map((message) => [message.id, message])
+        );
+        previous.forEach((message) => {
+          if (!mergedMessages.has(message.id)) mergedMessages.set(message.id, message);
+        });
+        return [...mergedMessages.values()].sort(
+          (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        );
+      });
+    }
+  }, [activeChannel, showError]);
+
   useEffect(() => {
     if (!activeChannel) return;
 
@@ -691,40 +720,31 @@ export default function App() {
           }
         }
       )
-      .subscribe((status) => {
-        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-          showError('Koneksi realtime pesan gagal. Periksa konfigurasi Realtime Supabase.');
-        }
-      });
+      .subscribe();
 
-    void supabase
-      .from('messages')
-      .select('*, profiles(full_name)')
-      .eq('channel_id', activeChannel.id)
-      .order('created_at', { ascending: true })
-      .then(({ data, error }) => {
-        if (error) showError(`Gagal memuat pesan: ${error.message}`);
-        if (active && data) {
-          setMessages((previous) => {
-            const mergedMessages = new Map(
-              (data as TeamMessage[]).map((message) => [message.id, message])
-            );
-            previous.forEach((message) => {
-              if (!mergedMessages.has(message.id)) mergedMessages.set(message.id, message);
-            });
-            return [...mergedMessages.values()].sort(
-              (a, b) =>
-                new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-            );
-          });
-        }
-      });
+    const initialFetch = window.setTimeout(() => {
+      void fetchMessages(() => active);
+    }, 0);
 
     return () => {
       active = false;
+      window.clearTimeout(initialFetch);
       void supabase.removeChannel(realtimeChannel);
     };
-  }, [activeChannel, showError]);
+  }, [activeChannel, fetchMessages, showError]);
+
+  useEffect(() => {
+    if (activeTab !== 'messages' || !activeChannel) return;
+
+    let active = true;
+    const interval = window.setInterval(() => {
+      void fetchMessages(() => active);
+    }, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [activeTab, activeChannel, fetchMessages]);
 
   const filteredMessages = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -1054,7 +1074,9 @@ export default function App() {
     if (error) {
       setNewMessage(content);
       showError(`Pesan tidak terkirim: ${error.message}`);
+      return;
     }
+    await fetchMessages();
   };
 
   const recordActivityNotification = async (
