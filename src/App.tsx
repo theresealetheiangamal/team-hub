@@ -79,6 +79,7 @@ type Task = {
   workspace_id: string;
   title: string;
   description?: string | null;
+  due_date?: string | null;
   reference_link?: string | null;
   status: 'todo' | 'in_progress' | 'done';
   created_at?: string;
@@ -209,6 +210,13 @@ function csvCell(value: string | null | undefined) {
   return `"${safeText.replace(/"/g, '""')}"`;
 }
 
+function formatTaskDeadline(dueDate: string | null | undefined) {
+  if (!dueDate) return null;
+  const date = new Date(dueDate);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
+}
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
@@ -243,6 +251,7 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskDescription, setNewTaskDescription] = useState('');
+  const [newTaskDueDate, setNewTaskDueDate] = useState('');
   const [newTaskReferenceLink, setNewTaskReferenceLink] = useState('');
   const [taskTargetType, setTaskTargetType] = useState<'team' | 'personal'>('team');
   const [taskAssigneeId, setTaskAssigneeId] = useState('');
@@ -455,11 +464,13 @@ export default function App() {
     const handleKeyboardShortcut = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
-        searchInputRef.current?.focus();
+        setCollapsed(false);
+        window.setTimeout(() => searchInputRef.current?.focus(), 0);
       }
       if (event.key === 'Escape') {
         setActiveModal(null);
         setShowCreateMenu(false);
+        setSearch('');
       }
     };
     window.addEventListener('keydown', handleKeyboardShortcut);
@@ -1000,10 +1011,25 @@ export default function App() {
         .slice(0, 5),
     [visibleTasks]
   );
+  const tasksWithUpcomingDeadlines = useMemo(
+    () =>
+      visibleTasks
+        .filter((task) => task.status !== 'done' && Boolean(formatTaskDeadline(task.due_date)))
+        .sort(
+          (a, b) =>
+            new Date(a.due_date || 0).getTime() - new Date(b.due_date || 0).getTime()
+        )
+        .slice(0, 3),
+    [visibleTasks]
+  );
   const filteredTasks = useMemo(() => {
     const term = search.trim().toLowerCase();
     return term
-      ? visibleTasks.filter((task) => task.title.toLowerCase().includes(term))
+      ? visibleTasks.filter(
+          (task) =>
+            task.title.toLowerCase().includes(term) ||
+            task.description?.toLowerCase().includes(term)
+        )
       : visibleTasks;
   }, [search, visibleTasks]);
 
@@ -1017,6 +1043,69 @@ export default function App() {
         )
       : documents;
   }, [documents, search]);
+
+  const globalSearchGroups = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    if (term.length < 2) return [];
+    return [
+      {
+        label: 'Pesan Obrolan',
+        tab: 'messages' as const,
+        items: messages
+          .filter((message) => message.content.toLowerCase().includes(term))
+          .map((message) => ({
+            id: message.id,
+            title: message.profiles?.full_name || 'Pesan obrolan',
+            detail: message.content,
+          })),
+      },
+      {
+        label: 'Tugas Tim',
+        tab: 'tasks' as const,
+        items: visibleTasks
+          .filter(
+            (task) =>
+              task.title.toLowerCase().includes(term) ||
+              task.description?.toLowerCase().includes(term)
+          )
+          .map((task) => ({
+            id: task.id,
+            title: task.title,
+            detail: task.description || 'Tidak ada perintah tugas.',
+          })),
+      },
+      {
+        label: 'Notulensi',
+        tab: 'docs' as const,
+        items: documents
+          .filter(
+            (document) =>
+              document.title.toLowerCase().includes(term) ||
+              document.content.toLowerCase().includes(term)
+          )
+          .map((document) => ({
+            id: document.id,
+            title: document.title,
+            detail: document.content || 'Notulensi kosong.',
+          })),
+      },
+      {
+        label: 'Agenda Kalender',
+        tab: 'calendar' as const,
+        items: events
+          .filter(
+            (event) =>
+              event.title.toLowerCase().includes(term) ||
+              event.location?.toLowerCase().includes(term)
+          )
+          .map((event) => ({
+            id: event.id,
+            title: event.title,
+            detail: event.location || 'Agenda tim',
+          })),
+      },
+    ];
+  }, [documents, events, messages, search, visibleTasks]);
 
   const historyTasks = useMemo(() => {
     const term = historySearch.trim().toLowerCase();
@@ -1106,6 +1195,7 @@ export default function App() {
             getTaskHistoryDate(task)
               ? new Date(getTaskHistoryDate(task)!).toLocaleString('id-ID')
               : '',
+            task.due_date ? new Date(task.due_date).toLocaleString('id-ID') : '',
             task.status,
             '',
             '',
@@ -1130,6 +1220,7 @@ export default function App() {
             '',
             new Date(event.start_time).toLocaleString('id-ID'),
             '',
+            '',
             isOnlineEvent(event) ? 'Online' : event.meeting_type === 'offline' ? 'Offline' : 'Agenda',
             event.location || '',
             '',
@@ -1144,6 +1235,7 @@ export default function App() {
         'Leader / Penjadwal',
         'Pelaksana',
         'Tanggal',
+        'Tenggat Waktu',
         'Status',
         'Tipe Rapat',
         'Lokasi',
@@ -1366,6 +1458,7 @@ export default function App() {
         workspace_id: workspace.id,
         title: newTaskTitle.trim(),
         description: newTaskDescription.trim() || null,
+        due_date: newTaskDueDate ? new Date(newTaskDueDate).toISOString() : null,
         reference_link: newTaskReferenceLink.trim() || null,
         status: 'todo',
         created_by: session.user.id,
@@ -1393,6 +1486,7 @@ export default function App() {
     setTasks((previous) => [data as Task, ...previous]);
     setNewTaskTitle('');
     setNewTaskDescription('');
+    setNewTaskDueDate('');
     setNewTaskReferenceLink('');
     setTaskInstructionFile(null);
     setTaskAssigneeId('');
@@ -1404,6 +1498,24 @@ export default function App() {
         taskAssigneeId
       );
     }
+  };
+
+  const selectGlobalSearchResult = (
+    tab: 'messages' | 'tasks' | 'docs' | 'calendar',
+    id: string
+  ) => {
+    if (tab === 'docs') {
+      const document = documents.find((item) => item.id === id);
+      if (document) {
+        setSelectedDocumentId(document.id);
+        setDocumentTitle(document.title);
+        setDocumentContent(document.content);
+        setDocumentRevisions([]);
+        setSelectedRevisionId(null);
+      }
+    }
+    navigateToTab(tab);
+    setSearch('');
   };
 
   const notifyTaskLeaderCompletion = async (task: Task) => {
@@ -2124,12 +2236,49 @@ export default function App() {
             <div className="relative">
               <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
               <input
+                ref={searchInputRef}
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
-                placeholder="Cari pesan, tugas, notulensi..."
+                placeholder="Cari pesan, tugas, notulensi, agenda..."
                 aria-label="Pencarian cepat"
+                aria-expanded={search.trim().length >= 2}
                 className="w-full rounded-lg border border-slate-800 bg-slate-950 py-2 pl-9 pr-3 text-xs text-slate-200 outline-none transition placeholder:text-slate-600 focus:border-indigo-500/70"
               />
+              {search.trim().length >= 2 && (
+                <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-[min(70vh,32rem)] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-2 shadow-2xl">
+                  {globalSearchGroups.some((group) => group.items.length > 0) ? (
+                    globalSearchGroups.map(
+                      (group) =>
+                        group.items.length > 0 && (
+                          <section key={group.label} className="mb-2 last:mb-0">
+                            <h3 className="px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                              {group.label}
+                            </h3>
+                            {group.items.slice(0, 5).map((item) => (
+                              <button
+                                key={item.id}
+                                type="button"
+                                onClick={() => selectGlobalSearchResult(group.tab, item.id)}
+                                className="block w-full rounded-lg px-2 py-2 text-left transition hover:bg-slate-800"
+                              >
+                                <span className="block truncate text-xs font-medium text-slate-200">
+                                  {item.title}
+                                </span>
+                                <span className="mt-0.5 block truncate text-[10px] text-slate-500">
+                                  {item.detail}
+                                </span>
+                              </button>
+                            ))}
+                          </section>
+                        )
+                    )
+                  ) : (
+                    <p className="px-2 py-4 text-center text-xs text-slate-500">
+                      Tidak ada hasil untuk “{search.trim()}”.
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           ) : (
             <button
@@ -2581,6 +2730,40 @@ export default function App() {
                           })}
                         </div>
                       )}
+                      {tasksWithUpcomingDeadlines.length > 0 && (
+                        <div className="mt-4 border-t border-slate-800 pt-4">
+                          <h4 className="mb-2 text-xs font-medium text-slate-300">
+                            Tenggat Tugas Terdekat
+                          </h4>
+                          <div className="space-y-2">
+                            {tasksWithUpcomingDeadlines.map((task) => (
+                              <button
+                                key={task.id}
+                                type="button"
+                                onClick={() => navigateToTab('tasks')}
+                                className="flex w-full items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-left hover:border-indigo-500/30"
+                              >
+                                <span className="min-w-0 truncate text-xs font-medium text-slate-200">
+                                  {task.title}
+                                </span>
+                                <span
+                                  className={`shrink-0 text-[10px] ${
+                                    new Date(task.due_date || 0).getTime() < currentTime
+                                      ? 'text-red-300'
+                                      : 'text-amber-300'
+                                  }`}
+                                >
+                                  <Clock3 className="mr-1 inline h-3 w-3" />
+                                  {new Date(task.due_date || 0).getTime() < currentTime
+                                    ? '⚠️ Terlambat:'
+                                    : '⏰ Tenggat:'}{' '}
+                                  {formatTaskDeadline(task.due_date)}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </>
                   ) : (
                     <>
@@ -2615,8 +2798,27 @@ export default function App() {
                               onClick={() => navigateToTab('tasks')}
                               className="flex w-full items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-left hover:border-indigo-500/30"
                             >
-                              <span className="min-w-0 truncate text-xs font-medium text-slate-200">
-                                {task.title}
+                              <span className="min-w-0">
+                                <span className="block truncate text-xs font-medium text-slate-200">
+                                  {task.title}
+                                </span>
+                                {task.due_date && formatTaskDeadline(task.due_date) && (
+                                  <span
+                                    className={`mt-1 flex items-center gap-1 text-[10px] ${
+                                      task.status !== 'done' &&
+                                      new Date(task.due_date).getTime() < currentTime
+                                        ? 'text-red-300'
+                                        : 'text-amber-300'
+                                    }`}
+                                  >
+                                    <Clock3 className="h-3 w-3" />
+                                    {task.status !== 'done' &&
+                                    new Date(task.due_date).getTime() < currentTime
+                                      ? '⚠️ Terlambat:'
+                                      : '⏰ Tenggat:'}{' '}
+                                    {formatTaskDeadline(task.due_date)}
+                                  </span>
+                                )}
                               </span>
                               <span
                                 className={`shrink-0 rounded-md px-2 py-1 text-[10px] ${
@@ -3185,6 +3387,15 @@ export default function App() {
                       />
                     </label>
                     <label className="block text-xs font-medium text-slate-300">
+                      Tenggat Waktu (Deadline) · Opsional
+                      <input
+                        type="datetime-local"
+                        value={newTaskDueDate}
+                        onChange={(event) => setNewTaskDueDate(event.target.value)}
+                        className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-indigo-500"
+                      />
+                    </label>
+                    <label className="block text-xs font-medium text-slate-300">
                       Link Situs Referensi (Opsional)
                       <input
                         type="url"
@@ -3310,6 +3521,23 @@ export default function App() {
                               {task.description && (
                                 <p className="mt-3 whitespace-pre-wrap text-xs leading-5 text-slate-300">
                                   {task.description}
+                                </p>
+                              )}
+                              {task.due_date && formatTaskDeadline(task.due_date) && (
+                                <p
+                                  className={`mt-3 inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[10px] ${
+                                    task.status !== 'done' &&
+                                    new Date(task.due_date).getTime() < currentTime
+                                      ? 'bg-red-500/10 text-red-300'
+                                      : 'bg-amber-500/10 text-amber-200'
+                                  }`}
+                                >
+                                  <Clock3 className="h-3 w-3" />
+                                  {task.status !== 'done' &&
+                                  new Date(task.due_date).getTime() < currentTime
+                                    ? '⚠️ Terlambat:'
+                                    : '⏰ Tenggat:'}{' '}
+                                  {formatTaskDeadline(task.due_date)}
                                 </p>
                               )}
                               {task.reference_link && (

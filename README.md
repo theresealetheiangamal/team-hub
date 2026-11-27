@@ -43,6 +43,13 @@ ADD COLUMN IF NOT EXISTS read_by uuid[] NOT NULL DEFAULT '{}';
 
 Pastikan juga kebijakan Row Level Security mengizinkan anggota workspace membaca dan memperbarui tanda baca pesan di kanal workspace mereka.
 
+Tenggat waktu tugas memerlukan kolom `due_date` bertipe `timestamptz` pada tabel `public.tasks`:
+
+```sql
+ALTER TABLE public.tasks
+ADD COLUMN IF NOT EXISTS due_date timestamptz;
+```
+
 ---
 
 ## ⚙️ Cara Menjalankan di Lokal (*Local Development*)
