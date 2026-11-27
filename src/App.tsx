@@ -66,7 +66,13 @@ type TeamMessage = {
   sender_id: string;
   content: string;
   created_at: string;
+  read_by?: string[] | null;
   profiles?: { full_name: string | null } | null;
+};
+type TeamPresence = {
+  user_id: string;
+  full_name: string;
+  isTyping: boolean;
 };
 type Task = {
   id: string;
@@ -232,6 +238,8 @@ export default function App() {
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [messages, setMessages] = useState<TeamMessage[]>([]);
   const [newMessage, setNewMessage] = useState('');
+  const [onlineMembers, setOnlineMembers] = useState<TeamPresence[]>([]);
+  const [readTooltipMessageId, setReadTooltipMessageId] = useState<string | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskDescription, setNewTaskDescription] = useState('');
@@ -266,6 +274,10 @@ export default function App() {
   const [settingsLeaderId, setSettingsLeaderId] = useState('');
   const searchInputRef = useRef<HTMLInputElement>(null);
   const avatarFileInputRef = useRef<HTMLInputElement>(null);
+  const presenceChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const typingTimeoutRef = useRef<number | null>(null);
+  const typingStatusRef = useRef(false);
+  const markingReadMessageIdsRef = useRef(new Set<string>());
 
   const showError = useCallback((message: string) => {
     setNoticeIsError(true);
@@ -275,6 +287,32 @@ export default function App() {
     setNoticeIsError(false);
     setNotice(message);
   }, []);
+  const trackTypingStatus = useCallback(
+    (isTyping: boolean) => {
+      typingStatusRef.current = isTyping;
+      if (typingTimeoutRef.current !== null) {
+        window.clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = null;
+      }
+
+      const channel = presenceChannelRef.current;
+      if (!channel || !session?.user) return;
+
+      void channel
+        .track({
+          user_id: session.user.id,
+          full_name: profile?.full_name || session.user.email || 'Anggota',
+          isTyping,
+        })
+        .then((status) => {
+          if (status !== 'ok') showError('Status mengetik tidak dapat disinkronkan.');
+        })
+        .catch((error: Error) => {
+          showError(`Status mengetik tidak dapat disinkronkan: ${error.message}`);
+        });
+    },
+    [profile?.full_name, session, showError]
+  );
   const navigateToTab = (tab: Tab) => {
     setActiveTab(tab);
     setActiveModal(null);
@@ -660,6 +698,56 @@ export default function App() {
     };
   }, [session, workspace]);
 
+  useEffect(() => {
+    if (!session?.user || !workspace) return;
+
+    let active = true;
+    const channel = supabase.channel(`team-presence-${workspace.id}`, {
+      config: { presence: { key: session.user.id } },
+    });
+    presenceChannelRef.current = channel;
+
+    const syncOnlineMembers = () => {
+      const usersById = new Map<string, TeamPresence>();
+      Object.values(channel.presenceState<TeamPresence>())
+        .flat()
+        .forEach((presence) => {
+          const previous = usersById.get(presence.user_id);
+          usersById.set(presence.user_id, {
+            ...presence,
+            isTyping: Boolean(presence.isTyping || previous?.isTyping),
+          });
+        });
+      if (active) setOnlineMembers([...usersById.values()]);
+    };
+
+    channel
+      .on('presence', { event: 'sync' }, syncOnlineMembers)
+      .on('presence', { event: 'join' }, syncOnlineMembers)
+      .on('presence', { event: 'leave' }, syncOnlineMembers)
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          trackTypingStatus(typingStatusRef.current);
+          if (typingStatusRef.current) {
+            typingTimeoutRef.current = window.setTimeout(
+              () => trackTypingStatus(false),
+              2000
+            );
+          }
+        }
+      });
+
+    return () => {
+      active = false;
+      if (presenceChannelRef.current === channel) presenceChannelRef.current = null;
+      if (typingTimeoutRef.current !== null) {
+        window.clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = null;
+      }
+      void supabase.removeChannel(channel);
+    };
+  }, [session, trackTypingStatus, workspace]);
+
   const fetchMessages = useCallback(async (isActive: () => boolean = () => true) => {
     if (!activeChannel) return;
 
@@ -677,10 +765,15 @@ export default function App() {
     if (data && isActive()) {
       setMessages((previous) => {
         const mergedMessages = new Map(
-          (data as TeamMessage[]).map((message) => [message.id, message])
+          previous.map((message) => [message.id, message])
         );
-        previous.forEach((message) => {
-          if (!mergedMessages.has(message.id)) mergedMessages.set(message.id, message);
+        (data as TeamMessage[]).forEach((message) => {
+          const previousMessage = mergedMessages.get(message.id);
+          mergedMessages.set(message.id, {
+            ...previousMessage,
+            ...message,
+            profiles: message.profiles ?? previousMessage?.profiles,
+          });
         });
         return [...mergedMessages.values()].sort(
           (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
@@ -720,6 +813,26 @@ export default function App() {
           }
         }
       )
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'messages',
+          filter: `channel_id=eq.${activeChannel.id}`,
+        },
+        (payload) => {
+          const row = payload.new as TeamMessage;
+          if (!active) return;
+          setMessages((previous) =>
+            previous.map((message) =>
+              message.id === row.id
+                ? { ...message, ...row, profiles: row.profiles ?? message.profiles }
+                : message
+            )
+          );
+        }
+      )
       .subscribe();
 
     const initialFetch = window.setTimeout(() => {
@@ -746,11 +859,84 @@ export default function App() {
     };
   }, [activeTab, activeChannel, fetchMessages]);
 
+  useEffect(() => {
+    const userId = session?.user.id;
+    if (activeTab !== 'messages' || !userId || messages.length === 0) return;
+
+    let active = true;
+    const unreadMessages = messages.filter(
+      (message) =>
+        message.sender_id !== userId &&
+        !message.read_by?.includes(userId) &&
+        !markingReadMessageIdsRef.current.has(message.id)
+    );
+
+    unreadMessages.forEach((message) => {
+      markingReadMessageIdsRef.current.add(message.id);
+      void (async () => {
+        const { data: currentMessage, error: readError } = await supabase
+          .from('messages')
+          .select('read_by')
+          .eq('id', message.id)
+          .maybeSingle();
+
+        if (readError) {
+          markingReadMessageIdsRef.current.delete(message.id);
+          if (active) showError(`Status baca pesan tidak dapat dimuat: ${readError.message}`);
+          return;
+        }
+        if (!currentMessage) return;
+
+        const readBy = Array.isArray(currentMessage.read_by)
+          ? (currentMessage.read_by as string[])
+          : [];
+        if (readBy.includes(userId)) {
+          if (active) {
+            setMessages((previous) =>
+              previous.map((item) =>
+                item.id === message.id ? { ...item, read_by: readBy } : item
+              )
+            );
+          }
+          return;
+        }
+
+        const updatedReadBy = [...readBy, userId];
+        const { error: updateError } = await supabase
+          .from('messages')
+          .update({ read_by: updatedReadBy })
+          .eq('id', message.id);
+
+        if (updateError) {
+          markingReadMessageIdsRef.current.delete(message.id);
+          if (active) showError(`Status baca pesan tidak dapat disimpan: ${updateError.message}`);
+          return;
+        }
+
+        if (active) {
+          setMessages((previous) =>
+            previous.map((item) =>
+              item.id === message.id ? { ...item, read_by: updatedReadBy } : item
+            )
+          );
+        }
+      })();
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [activeTab, messages, session?.user.id, showError]);
+
   const filteredMessages = useMemo(() => {
     const term = search.trim().toLowerCase();
     if (!term) return messages;
     return messages.filter((message) => message.content.toLowerCase().includes(term));
   }, [messages, search]);
+
+  const typingMembers = onlineMembers.filter(
+    (member) => member.user_id !== session?.user.id && member.isTyping
+  );
 
   const currentUser = session?.user;
   const isWorkspaceLeader = profile?.role
@@ -1065,6 +1251,7 @@ export default function App() {
     event.preventDefault();
     if (!newMessage.trim() || !activeChannel || !session?.user) return;
     const content = newMessage.trim();
+    trackTypingStatus(false);
     setNewMessage('');
     const { error } = await supabase.from('messages').insert({
       channel_id: activeChannel.id,
@@ -1756,10 +1943,10 @@ export default function App() {
 
   if (!session) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-950 p-4 text-slate-100">
+      <div className="flex min-h-screen flex-col items-center justify-center bg-slate-950 p-4 py-8 text-slate-100">
         <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 shadow-2xl">
           <div className="mb-2 flex items-center gap-2 text-2xl font-bold text-indigo-400">
-            <Sparkles className="h-6 w-6" />
+            <img src="/logo.svg" alt="" className="h-8 w-8 rounded-lg" />
             <span>Team-Hub</span>
           </div>
           <p className="mb-6 text-sm text-slate-400">
@@ -1861,6 +2048,9 @@ export default function App() {
             {isSignUp ? 'Sudah punya akun? Masuk di sini' : 'Belum punya akun? Daftar gratis'}
           </button>
         </div>
+        <p className="mt-4 text-center text-[11px] text-slate-500">
+          © 2026 Team-Hub • Creator Derry Ngamal Kulas
+        </p>
       </div>
     );
   }
@@ -1894,9 +2084,7 @@ export default function App() {
             className="flex min-w-0 items-center gap-2.5 text-left"
             aria-label="Team-Hub beranda"
           >
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-indigo-500/15 text-indigo-300">
-              <Sparkles className="h-5 w-5" />
-            </span>
+            <img src="/logo.svg" alt="" className="h-8 w-8 shrink-0 rounded-lg" />
             {!collapsed && <span className="truncate text-base font-bold tracking-tight">Team-Hub</span>}
           </button>
           {!collapsed && (
@@ -2490,6 +2678,25 @@ export default function App() {
 
           {activeTab === 'messages' && (
             <section className="flex h-full min-h-[400px] flex-col">
+              <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-slate-800 px-4 py-2.5 sm:px-8">
+                <span className="mr-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                  Online
+                </span>
+                {onlineMembers.length === 0 ? (
+                  <span className="text-[11px] text-slate-500">Menunggu anggota online...</span>
+                ) : (
+                  onlineMembers.map((member) => (
+                    <span
+                      key={member.user_id}
+                      className="inline-flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-900 px-2.5 py-1 text-[11px] text-slate-300"
+                      aria-label={`${member.full_name} online`}
+                    >
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" />
+                      {member.full_name}
+                    </span>
+                  ))
+                )}
+              </div>
               <div className="flex-1 space-y-5 overflow-y-auto px-4 py-6 sm:px-8">
                 {filteredMessages.length === 0 ? (
                   <div className="flex h-full min-h-64 flex-col items-center justify-center text-center">
@@ -2508,6 +2715,15 @@ export default function App() {
                 ) : (
                   filteredMessages.map((message) => {
                     const isOwnMessage = message.sender_id === session.user.id;
+                    const readers = [...new Set(message.read_by ?? [])].map((readerId) =>
+                      getHistoryPersonName(
+                        readerId,
+                        members,
+                        leaders,
+                        session.user.id,
+                        profile?.full_name
+                      )
+                    );
                     return (
                       <article key={message.id} className="flex gap-3">
                         <div
@@ -2529,6 +2745,38 @@ export default function App() {
                             <time className="text-[10px] text-slate-600">
                               {new Date(message.created_at).toLocaleString('id-ID')}
                             </time>
+                            {isOwnMessage &&
+                              (readers.length > 0 ? (
+                                <span className="group relative inline-flex">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setReadTooltipMessageId((current) =>
+                                        current === message.id ? null : message.id
+                                      )
+                                    }
+                                    aria-label={`Dibaca oleh ${readers.join(', ')}`}
+                                    className="text-cyan-400"
+                                  >
+                                    <CheckCheck className="h-3.5 w-3.5" />
+                                  </button>
+                                  <span
+                                    role="tooltip"
+                                    className={`pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 whitespace-nowrap rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-[10px] text-slate-200 shadow-xl ${
+                                      readTooltipMessageId === message.id
+                                        ? 'block'
+                                        : 'hidden group-hover:block group-focus-within:block'
+                                    }`}
+                                  >
+                                    Dibaca oleh {readers.join(', ')}
+                                  </span>
+                                </span>
+                              ) : (
+                                <Check
+                                  className="h-3.5 w-3.5 text-slate-500"
+                                  aria-label="Pesan terkirim"
+                                />
+                              ))}
                           </div>
                           <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-slate-300">
                             {message.content}
@@ -2540,10 +2788,39 @@ export default function App() {
                 )}
               </div>
               <form onSubmit={handleSendMessage} className="border-t border-slate-800 p-4 sm:px-8">
+                {typingMembers.length > 0 && (
+                  <div
+                    className="mx-auto mb-2 flex max-w-5xl items-center gap-2 px-2 text-[11px] text-slate-400"
+                    aria-live="polite"
+                  >
+                    <span>
+                      {typingMembers.length === 1
+                        ? `${typingMembers[0].full_name} sedang mengetik`
+                        : 'Beberapa orang sedang mengetik'}
+                    </span>
+                    <span className="inline-flex items-center gap-0.5" aria-hidden="true">
+                      <span className="h-1 w-1 animate-bounce rounded-full bg-indigo-300 [animation-delay:-0.3s]" />
+                      <span className="h-1 w-1 animate-bounce rounded-full bg-indigo-300 [animation-delay:-0.15s]" />
+                      <span className="h-1 w-1 animate-bounce rounded-full bg-indigo-300" />
+                    </span>
+                  </div>
+                )}
                 <div className="mx-auto flex max-w-5xl items-end gap-3 rounded-xl border border-slate-800 bg-slate-900 p-2 focus-within:border-slate-700">
                   <textarea
                     value={newMessage}
-                    onChange={(event) => setNewMessage(event.target.value)}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setNewMessage(value);
+                      if (value.trim()) {
+                        trackTypingStatus(true);
+                        typingTimeoutRef.current = window.setTimeout(
+                          () => trackTypingStatus(false),
+                          2000
+                        );
+                      } else {
+                        trackTypingStatus(false);
+                      }
+                    }}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter' && !event.shiftKey) {
                         event.preventDefault();
@@ -3878,6 +4155,12 @@ export default function App() {
             </section>
           )}
         </div>
+        {activeTab === 'dashboard' && (
+          <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-slate-800 px-4 py-2 text-[10px] text-slate-500 sm:px-7">
+            <span>© 2026 Team-Hub • Hak Cipta Dilindungi</span>
+            <span>v1.0</span>
+          </footer>
+        )}
         {activeModal && (
           <div
             className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm"

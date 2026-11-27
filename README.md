@@ -14,7 +14,7 @@
   * Penugasan fleksibel untuk **Seluruh Tim Binaan** maupun **Personal (@Mention)**.
   * Mendukung perintah detail, tautan referensi eksternal, **unggah lampiran dokumen tugas** dari *Leader*, serta **unggah bukti hasil pengerjaan** dari *Member*.
   * Papan status interaktif (*To Do*, *In Progress*, *Done*) dengan notifikasi otomatis ke *Leader* saat tugas selesai.
-* **💬 Obrolan Tim (*Team Messenger*):** Ruang komunikasi langsung berkecepatan tinggi yang didukung sinkronisasi *real-time* dan *auto-sync* optimal untuk jaringan seluler maupun desktop.
+* **💬 Obrolan Tim (*Team Messenger*):** Ruang komunikasi langsung dengan sinkronisasi *real-time* dan *auto-sync* untuk jaringan seluler maupun desktop, daftar anggota online, indikator mengetik, serta centang baca pada pesan.
 * **📅 Kalender Agenda (Online & Offline) & Video Conference:**
   * Mendukung penjadwalan **Rapat Online** (terintegrasi ruang video rapat instan Jitsi Meet) maupun **Rapat Offline / Tatap Muka** lengkap dengan rincian lokasi/tempat.
 * **📝 Notulensi dengan Jejak Riwayat Permanen (*Version History*):**
@@ -31,6 +31,17 @@
 * **Backend & Database:** Supabase (PostgreSQL, Authentication, Row Level Security, Realtime, Storage)
 * **Video Conference:** Jitsi Meet Integration
 * **Deployment & Hosting:** Cloudflare Pages (CI/CD otomatis dari GitHub)
+
+### Pengaturan tanda baca pesan
+
+Fitur centang baca memerlukan kolom `read_by` pada tabel `public.messages` dengan tipe `uuid[]`. Tambahkan kolom ini di Supabase jika belum tersedia:
+
+```sql
+ALTER TABLE public.messages
+ADD COLUMN IF NOT EXISTS read_by uuid[] NOT NULL DEFAULT '{}';
+```
+
+Pastikan juga kebijakan Row Level Security mengizinkan anggota workspace membaca dan memperbarui tanda baca pesan di kanal workspace mereka.
 
 ---
 
