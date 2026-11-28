@@ -2133,114 +2133,117 @@ export default function App() {
 
   if (!session) {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center bg-slate-950 p-4 py-8 text-slate-100">
-        <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 shadow-2xl">
-          <div className="mb-2 flex items-center gap-2 text-2xl font-bold text-indigo-400">
-            <img src="/logo.svg" alt="" className="h-8 w-8 rounded-lg" />
-            <span>Team-Hub</span>
-          </div>
-          <p className="mb-6 text-sm text-slate-400">
-            {isSignUp ? 'Buat akun ruang kerja baru Anda' : 'Masuk ke ruang kerja kolaborasi Anda'}
-          </p>
-          {authError && (
-            <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300">
-              {authError}
+      <div className="flex min-h-screen flex-col bg-slate-950 text-slate-100">
+        <div className="flex flex-1 flex-col items-center justify-center p-4 py-8">
+          <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-8 shadow-2xl">
+            <div className="mb-2 flex items-center gap-2 text-2xl font-bold text-indigo-400">
+              <img src="/logo.svg" alt="" className="h-8 w-8 rounded-lg" />
+              <span>Team-Hub</span>
             </div>
-          )}
-          <form onSubmit={handleAuth} className="space-y-4">
-            {isSignUp && (
-              <>
-                <label className="block text-xs text-slate-400">
-                  Nama Lengkap
-                  <input
-                    type="text"
-                    required
-                    value={fullName}
-                    onChange={(event) => setFullName(event.target.value)}
-                    className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
-                    placeholder="Contoh: Pak Derry"
-                  />
-                </label>
-                <label className="block text-xs text-slate-400">
-                  Pilih Peran
-                  <select
-                    value={signupRole}
-                    onChange={(event) => {
-                      setSignupRole(event.target.value as 'leader' | 'member');
-                      setSignupLeaderId('');
-                    }}
-                    className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
-                  >
-                    <option value="leader">Leader</option>
-                    <option value="member">Member</option>
-                  </select>
-                </label>
-                {signupRole === 'member' && (
+            <p className="mb-6 text-sm text-slate-400">
+              {isSignUp ? 'Buat akun ruang kerja baru Anda' : 'Masuk ke ruang kerja kolaborasi Anda'}
+            </p>
+            {authError && (
+              <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300">
+                {authError}
+              </div>
+            )}
+            <form onSubmit={handleAuth} className="space-y-4">
+              {isSignUp && (
+                <>
                   <label className="block text-xs text-slate-400">
-                    Pilih Leader Pembimbing
-                    <select
+                    Nama Lengkap
+                    <input
+                      type="text"
                       required
-                      value={signupLeaderId}
-                      onChange={(event) => setSignupLeaderId(event.target.value)}
+                      value={fullName}
+                      onChange={(event) => setFullName(event.target.value)}
+                      className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
+                      placeholder="Contoh: Pak Derry"
+                    />
+                  </label>
+                  <label className="block text-xs text-slate-400">
+                    Pilih Peran
+                    <select
+                      value={signupRole}
+                      onChange={(event) => {
+                        setSignupRole(event.target.value as 'leader' | 'member');
+                        setSignupLeaderId('');
+                      }}
                       className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
                     >
-                      <option value="">Pilih Leader...</option>
-                      {leaders.map((leader) => (
-                        <option key={leader.id} value={leader.id}>
-                          {leader.full_name}
-                        </option>
-                      ))}
+                      <option value="leader">Leader</option>
+                      <option value="member">Member</option>
                     </select>
-                    {leaders.length === 0 && (
-                      <span className="mt-1 block text-amber-300">
-                        Belum ada Leader terdaftar.
-                      </span>
-                    )}
                   </label>
-                )}
-              </>
-            )}
-            <label className="block text-xs text-slate-400">
-              Email
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
-                placeholder="nama@email.com"
-              />
-            </label>
-            <label className="block text-xs text-slate-400">
-              Password
-              <input
-                type="password"
-                required
-                minLength={6}
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
-                placeholder="Minimal 6 karakter"
-              />
-            </label>
+                  {signupRole === 'member' && (
+                    <label className="block text-xs text-slate-400">
+                      Pilih Leader Pembimbing
+                      <select
+                        required
+                        value={signupLeaderId}
+                        onChange={(event) => setSignupLeaderId(event.target.value)}
+                        className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
+                      >
+                        <option value="">Pilih Leader...</option>
+                        {leaders.map((leader) => (
+                          <option key={leader.id} value={leader.id}>
+                            {leader.full_name}
+                          </option>
+                        ))}
+                      </select>
+                      {leaders.length === 0 && (
+                        <span className="mt-1 block text-amber-300">
+                          Belum ada Leader terdaftar.
+                        </span>
+                      )}
+                    </label>
+                  )}
+                </>
+              )}
+              <label className="block text-xs text-slate-400">
+                Email
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
+                  placeholder="nama@email.com"
+                />
+              </label>
+              <label className="block text-xs text-slate-400">
+                Password
+                <input
+                  type="password"
+                  required
+                  minLength={6}
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none"
+                  placeholder="Minimal 6 karakter"
+                />
+              </label>
+              <button
+                type="submit"
+                className="w-full rounded-lg bg-indigo-600 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-500"
+              >
+                {isSignUp ? 'Daftar Sekarang' : 'Masuk'}
+              </button>
+            </form>
             <button
-              type="submit"
-              className="w-full rounded-lg bg-indigo-600 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-500"
+              type="button"
+              onClick={() => setIsSignUp((value) => !value)}
+              className="mt-4 w-full text-xs text-slate-400 transition hover:text-indigo-300"
             >
-              {isSignUp ? 'Daftar Sekarang' : 'Masuk'}
+              {isSignUp ? 'Sudah punya akun? Masuk di sini' : 'Belum punya akun? Daftar gratis'}
             </button>
-          </form>
-          <button
-            type="button"
-            onClick={() => setIsSignUp((value) => !value)}
-            className="mt-4 w-full text-xs text-slate-400 transition hover:text-indigo-300"
-          >
-            {isSignUp ? 'Sudah punya akun? Masuk di sini' : 'Belum punya akun? Daftar gratis'}
-          </button>
+          </div>
         </div>
-        <p className="mt-4 text-center text-[11px] text-slate-500">
-          © 2026 Team-Hub • Creator Derry Ngamal Kulas
-        </p>
+        <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-slate-800/80 px-6 py-2 text-xs text-slate-500">
+          <span>© 2026 Team-Hub • Creator Aplikasi: Derry Ngamal Kulas</span>
+          <span>v1.0</span>
+        </footer>
       </div>
     );
   }
@@ -2566,7 +2569,7 @@ export default function App() {
         />
       )}
 
-      <main className="flex min-w-0 flex-1 flex-col">
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
         <header className="flex h-16 shrink-0 items-center justify-between border-b border-slate-800 bg-slate-950/90 px-4 sm:px-7">
           <div className="flex min-w-0 items-center gap-3">
             <button
@@ -4471,12 +4474,10 @@ export default function App() {
             </section>
           )}
         </div>
-        {activeTab === 'dashboard' && (
-          <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-slate-800 px-4 py-2 text-[10px] text-slate-500 sm:px-7">
-            <span>© 2026 Team-Hub • Hak Cipta Dilindungi</span>
-            <span>v1.0</span>
-          </footer>
-        )}
+        <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-slate-800/80 px-6 py-2 text-xs text-slate-500">
+          <span>© 2026 Team-Hub • Creator Aplikasi: Derry Ngamal Kulas</span>
+          <span>v1.0</span>
+        </footer>
         {activeModal && (
           <div
             className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm"
