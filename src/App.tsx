@@ -65,6 +65,7 @@ type TeamMessage = {
   id: string;
   channel_id: string;
   sender_id: string;
+  leader_group_id?: string | null;
   content: string;
   created_at: string;
   read_by?: string[] | null;
@@ -117,6 +118,7 @@ type DocumentRecord = {
   workspace_id: string;
   title: string;
   content: string;
+  created_by?: string;
   updated_at?: string;
 };
 type DocumentRevision = {
@@ -288,6 +290,38 @@ export default function App() {
   const typingTimeoutRef = useRef<number | null>(null);
   const typingStatusRef = useRef(false);
   const markingReadMessageIdsRef = useRef(new Set<string>());
+  const activeLeaderId =
+    profile?.role === 'leader'
+      ? session?.user.id ?? null
+      : profile?.role === 'member'
+        ? profile.leader_id
+        : null;
+  const teamUserIds = useMemo(
+    () =>
+      new Set([
+        ...(activeLeaderId ? [activeLeaderId] : []),
+        ...(profile?.role === 'member' && profile.leader_id === activeLeaderId
+          ? [profile.id]
+          : []),
+        ...members
+          .filter((member) => member.leader_id === activeLeaderId)
+          .map((member) => member.id),
+      ]),
+    [activeLeaderId, members, profile]
+  );
+  const teamMessages = useMemo(
+    () =>
+      messages.filter(
+        (message) =>
+          Boolean(
+            activeLeaderId &&
+              message.channel_id === activeChannel?.id &&
+              (message.leader_group_id === activeLeaderId ||
+                teamUserIds.has(message.sender_id))
+          )
+      ),
+    [activeChannel?.id, activeLeaderId, messages, teamUserIds]
+  );
 
   const showError = useCallback((message: string) => {
     setNoticeIsError(true);
@@ -377,13 +411,29 @@ export default function App() {
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       setSession(nextSession);
       setLoading(false);
-      if (_event === 'SIGNED_IN') setActiveTab('dashboard');
+      if (_event === 'SIGNED_IN') {
+        setActiveTab('dashboard');
+        setWorkspace(null);
+        setProfile(null);
+        setActiveChannel(null);
+        setMessages([]);
+        setOnlineMembers([]);
+        setTasks([]);
+        setMembers([]);
+        setEvents([]);
+        setDocuments([]);
+        setDocumentRevisions([]);
+        setSelectedRevisionId(null);
+        setNotifications([]);
+      }
       if (!nextSession) {
         setWorkspace(null);
         setProfile(null);
         setActiveChannel(null);
         setMessages([]);
+        setOnlineMembers([]);
         setTasks([]);
+        setMembers([]);
         setEvents([]);
         setDocuments([]);
         setDocumentRevisions([]);
@@ -479,33 +529,15 @@ export default function App() {
   }, []);
 
   const refreshWorkspace = useCallback(async (user: User) => {
-    const { data: memberships, error: membershipError } = await supabase
-      .from('workspace_members')
-      .select('workspace_id')
-      .eq('user_id', user.id)
-      .limit(1);
-    if (membershipError) throw membershipError;
-
-    const { data: ownedWorkspaces, error: workspaceError } = await supabase
+    const { data: firstWorkspace, error: workspaceError } = await supabase
       .from('workspaces')
       .select('*')
-      .eq('owner_id', user.id)
-      .limit(1);
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
     if (workspaceError) throw workspaceError;
 
-    let currentWorkspace: Workspace | null = null;
-    const memberWorkspaceId = memberships?.[0]?.workspace_id;
-    if (memberWorkspaceId) {
-      const { data: memberWorkspace, error: memberWorkspaceError } = await supabase
-        .from('workspaces')
-        .select('*')
-        .eq('id', memberWorkspaceId)
-        .maybeSingle();
-      if (memberWorkspaceError) throw memberWorkspaceError;
-      currentWorkspace = memberWorkspace;
-    }
-    currentWorkspace ??= (ownedWorkspaces?.[0] as Workspace | undefined) ?? null;
-
+    let currentWorkspace = firstWorkspace as Workspace | null;
     if (!currentWorkspace) {
       const { data: createdWorkspace, error: createError } = await supabase
         .from('workspaces')
@@ -515,20 +547,77 @@ export default function App() {
       if (createError) throw createError;
       if (!createdWorkspace) throw new Error('Supabase tidak mengembalikan ruang kerja baru.');
       currentWorkspace = createdWorkspace as Workspace;
-
-      const { error: memberError } = await supabase.from('workspace_members').insert({
-        workspace_id: createdWorkspace.id,
-        user_id: user.id,
-        role: 'admin',
-      });
-      if (memberError) throw memberError;
     }
 
     if (!currentWorkspace) throw new Error('Ruang kerja tidak berhasil dimuat atau dibuat.');
     setWorkspace(currentWorkspace);
+    const { error: membershipLookupError, data: existingMembership } = await supabase
+      .from('workspace_members')
+      .select('user_id')
+      .eq('workspace_id', currentWorkspace.id)
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (membershipLookupError) throw membershipLookupError;
+    if (!existingMembership) {
+      const { error: memberError } = await supabase.from('workspace_members').insert({
+        workspace_id: currentWorkspace.id,
+        user_id: user.id,
+        role: 'member',
+      });
+      if (memberError) throw memberError;
+    }
+
+    const { data: profileRow, error: profileError } = await supabase
+      .from('profiles')
+      .select('id, full_name, status, avatar_url, role, leader_id')
+      .eq('id', user.id)
+      .maybeSingle();
+    if (profileError) throw profileError;
+    if (profileRow) setProfile(profileRow as Profile);
+    const activeLeaderId =
+      profileRow?.role === 'leader'
+        ? user.id
+        : profileRow?.role === 'member'
+          ? profileRow.leader_id
+          : null;
+
+    const [
+      { data: leaderProfileRows, error: leaderProfileError },
+      { data: assignedProfileRows, error: assignedProfilesError },
+    ] = activeLeaderId
+      ? await Promise.all([
+          supabase
+            .from('profiles')
+            .select('id, full_name, role, leader_id, status')
+            .eq('id', activeLeaderId),
+          supabase
+            .from('profiles')
+            .select('id, full_name, role, leader_id, status')
+            .eq('leader_id', activeLeaderId),
+        ])
+      : [{ data: [], error: null }, { data: [], error: null }];
+    const loadedMembers: WorkspaceMember[] = [
+      ...(leaderProfileRows ?? []),
+      ...(assignedProfileRows ?? []),
+    ].map((member) => ({
+      id: member.id,
+      full_name: member.full_name || 'Anggota',
+      role: member.role || 'member',
+      leader_id: member.leader_id || null,
+      status: member.status || null,
+    }));
+    const groupUserIds = [
+      ...(activeLeaderId ? [activeLeaderId] : []),
+      ...(profileRow?.role === 'member' && profileRow.leader_id === activeLeaderId
+        ? [user.id]
+        : []),
+      ...loadedMembers
+        .filter((member) => member.leader_id === activeLeaderId)
+        .map((member) => member.id),
+    ];
+
     const [
       { data: channelRows, error: channelError },
-      { data: profileRow, error: profileError },
       { data: leaderRows, error: leadersError },
       { data: taskRows, error: taskError },
       { data: eventRows, error: eventError },
@@ -538,17 +627,33 @@ export default function App() {
       supabase.from('channels').select('*').eq('workspace_id', currentWorkspace.id).order('name'),
       supabase
         .from('profiles')
-        .select('id, full_name, status, avatar_url, role, leader_id')
-        .eq('id', user.id)
-        .maybeSingle(),
-      supabase
-        .from('profiles')
         .select('id, full_name')
         .eq('role', 'leader')
         .order('full_name'),
-      supabase.from('tasks').select('*').eq('workspace_id', currentWorkspace.id).order('created_at', { ascending: false }),
-      supabase.from('events').select('*').eq('workspace_id', currentWorkspace.id).order('start_time'),
-      supabase.from('documents').select('*').eq('workspace_id', currentWorkspace.id).order('updated_at', { ascending: false }),
+      activeLeaderId
+        ? supabase
+            .from('tasks')
+            .select('*')
+            .eq('workspace_id', currentWorkspace.id)
+            .eq('created_by', activeLeaderId)
+            .order('created_at', { ascending: false })
+        : Promise.resolve({ data: [], error: null }),
+      activeLeaderId
+        ? supabase
+            .from('events')
+            .select('*')
+            .eq('workspace_id', currentWorkspace.id)
+            .eq('created_by', activeLeaderId)
+            .order('start_time')
+        : Promise.resolve({ data: [], error: null }),
+      groupUserIds.length > 0
+        ? supabase
+            .from('documents')
+            .select('*')
+            .eq('workspace_id', currentWorkspace.id)
+            .in('created_by', groupUserIds)
+            .order('updated_at', { ascending: false })
+        : Promise.resolve({ data: [], error: null }),
       supabase
         .from('notifications')
         .select('*')
@@ -556,68 +661,16 @@ export default function App() {
         .eq('user_id', user.id)
         .order('created_at', { ascending: false }),
     ]);
-    const { data: membershipRows, error: membersError } = await supabase
-      .from('workspace_members')
-      .select('user_id, role')
-      .eq('workspace_id', currentWorkspace.id);
-    let loadedMembers: WorkspaceMember[] = [];
-    if (membersError) {
-      showError(`Anggota workspace tidak dapat dimuat: ${membersError.message}`);
-    } else if (membershipRows?.length) {
-      const { data: profileRows, error: membersProfileError } = await supabase
-        .from('profiles')
-        .select('id, full_name, role, leader_id, status')
-        .in('id', membershipRows.map((member) => member.user_id));
-      if (membersProfileError) {
-        showError(`Profil anggota tidak dapat dimuat: ${membersProfileError.message}`);
-      } else {
-        loadedMembers = (membershipRows ?? []).map((member) => ({
-          id: member.user_id,
-          full_name:
-            profileRows?.find((profileRecord) => profileRecord.id === member.user_id)
-              ?.full_name || 'Anggota',
-          role:
-            profileRows?.find((profileRecord) => profileRecord.id === member.user_id)
-              ?.role || member.role || 'member',
-          leader_id:
-            profileRows?.find((profileRecord) => profileRecord.id === member.user_id)
-              ?.leader_id || null,
-          status:
-            profileRows?.find((profileRecord) => profileRecord.id === member.user_id)
-              ?.status || null,
-        }));
-      }
-    }
-    const { data: assignedProfileRows, error: assignedProfilesError } = await supabase
-      .from('profiles')
-      .select('id, full_name, role, leader_id, status')
-      .eq('leader_id', user.id);
-    if (assignedProfilesError) {
-      showError(`Anggota binaan tidak dapat dimuat: ${assignedProfilesError.message}`);
-    } else {
-      const loadedMemberIds = new Set(loadedMembers.map((member) => member.id));
-      loadedMembers = [
-        ...loadedMembers,
-        ...(assignedProfileRows ?? [])
-          .filter((member) => !loadedMemberIds.has(member.id))
-          .map((member) => ({
-            id: member.id,
-            full_name: member.full_name || 'Anggota',
-            role: member.role || 'member',
-            leader_id: member.leader_id || null,
-            status: member.status || null,
-          })),
-      ];
-    }
 
     const errors = [
       channelError,
-      profileError,
       leadersError,
       taskError,
       eventError,
       documentError,
       notificationError,
+      leaderProfileError,
+      assignedProfilesError,
     ].filter((error) => error !== null);
     if (errors.length > 0) {
       showError(
@@ -651,7 +704,6 @@ export default function App() {
       }
       return loadedChannels.find((channel) => channel.name === 'general') ?? loadedChannels[0] ?? null;
     });
-    if (profileRow) setProfile(profileRow as Profile);
     if (leaderRows) {
       setLeaders(
         leaderRows.map((leader) => ({
@@ -661,9 +713,33 @@ export default function App() {
       );
     }
     setMembers(loadedMembers);
-    if (taskRows) setTasks(taskRows as Task[]);
-    if (eventRows) setEvents(eventRows as TeamEvent[]);
-    if (documentRows) setDocuments(documentRows as DocumentRecord[]);
+    if (taskRows) {
+      setTasks(
+        (taskRows as Task[]).filter(
+          (task) =>
+            task.created_by === activeLeaderId &&
+            (profileRow?.role !== 'member' ||
+              task.target_type === 'team' ||
+              (task.target_type === 'personal' && task.assignee_id === user.id))
+        )
+      );
+    }
+    if (eventRows) {
+      setEvents(
+        (eventRows as TeamEvent[]).filter((event) => event.created_by === activeLeaderId)
+      );
+    }
+    if (documentRows) {
+      const teamUserIds = new Set([
+        ...(activeLeaderId ? [activeLeaderId] : []),
+        ...loadedMembers.map((member) => member.id),
+      ]);
+      setDocuments(
+        (documentRows as DocumentRecord[]).filter(
+          (document) => Boolean(document.created_by && teamUserIds.has(document.created_by))
+        )
+      );
+    }
     if (notificationRows) setNotifications(notificationRows as NotificationRecord[]);
   }, [showError]);
 
@@ -711,7 +787,7 @@ export default function App() {
   }, [session, workspace]);
 
   useEffect(() => {
-    if (!session?.user || !workspace) return;
+    if (!session?.user || !workspace || !activeLeaderId) return;
 
     let active = true;
     const channel = supabase.channel(`team-presence-${workspace.id}`, {
@@ -724,6 +800,7 @@ export default function App() {
       Object.values(channel.presenceState<TeamPresence>())
         .flat()
         .forEach((presence) => {
+          if (!teamUserIds.has(presence.user_id)) return;
           const previous = usersById.get(presence.user_id);
           usersById.set(presence.user_id, {
             ...presence,
@@ -758,15 +835,21 @@ export default function App() {
       }
       void supabase.removeChannel(channel);
     };
-  }, [session, trackTypingStatus, workspace]);
+  }, [activeLeaderId, session, teamUserIds, trackTypingStatus, workspace]);
 
   const fetchMessages = useCallback(async (isActive: () => boolean = () => true) => {
-    if (!activeChannel) return;
+    if (!activeChannel || !activeLeaderId) {
+      if (isActive()) setMessages([]);
+      return;
+    }
 
     const { data, error } = await supabase
       .from('messages')
       .select('*, profiles(full_name)')
       .eq('channel_id', activeChannel.id)
+      .or(
+        `leader_group_id.eq.${activeLeaderId},sender_id.in.(${[...teamUserIds].join(',')})`
+      )
       .order('created_at', { ascending: true });
 
     if (error) {
@@ -775,29 +858,24 @@ export default function App() {
     }
 
     if (data && isActive()) {
-      setMessages((previous) => {
-        const mergedMessages = new Map(
-          previous.map((message) => [message.id, message])
-        );
-        (data as TeamMessage[]).forEach((message) => {
-          const previousMessage = mergedMessages.get(message.id);
-          mergedMessages.set(message.id, {
-            ...previousMessage,
-            ...message,
-            profiles: message.profiles ?? previousMessage?.profiles,
-          });
-        });
-        return [...mergedMessages.values()].sort(
-          (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-        );
-      });
+      setMessages(
+        (data as TeamMessage[]).filter(
+          (message) =>
+            message.leader_group_id === activeLeaderId ||
+            teamUserIds.has(message.sender_id)
+        )
+      );
     }
-  }, [activeChannel, showError]);
+  }, [activeChannel, activeLeaderId, showError, teamUserIds]);
 
   useEffect(() => {
-    if (!activeChannel) return;
+    if (!activeChannel || !activeLeaderId) {
+      return;
+    }
 
     let active = true;
+    const belongsToTeam = (message: TeamMessage) =>
+      message.leader_group_id === activeLeaderId || teamUserIds.has(message.sender_id);
     const realtimeChannel = supabase
       .channel(`messages-${activeChannel.id}`)
       .on(
@@ -810,6 +888,7 @@ export default function App() {
         },
         async (payload) => {
           const row = payload.new as TeamMessage;
+          if (!belongsToTeam(row)) return;
           const { data: senderProfile, error } = await supabase
             .from('profiles')
             .select('full_name')
@@ -836,6 +915,10 @@ export default function App() {
         (payload) => {
           const row = payload.new as TeamMessage;
           if (!active) return;
+          if (!belongsToTeam(row)) {
+            setMessages((previous) => previous.filter((message) => message.id !== row.id));
+            return;
+          }
           setMessages((previous) =>
             previous.map((message) =>
               message.id === row.id
@@ -856,7 +939,7 @@ export default function App() {
       window.clearTimeout(initialFetch);
       void supabase.removeChannel(realtimeChannel);
     };
-  }, [activeChannel, fetchMessages, showError]);
+  }, [activeChannel, activeLeaderId, fetchMessages, showError, teamUserIds]);
 
   useEffect(() => {
     if (activeTab !== 'messages' || !activeChannel) return;
@@ -873,10 +956,10 @@ export default function App() {
 
   useEffect(() => {
     const userId = session?.user.id;
-    if (activeTab !== 'messages' || !userId || messages.length === 0) return;
+    if (activeTab !== 'messages' || !userId || teamMessages.length === 0) return;
 
     let active = true;
-    const unreadMessages = messages.filter(
+    const unreadMessages = teamMessages.filter(
       (message) =>
         message.sender_id !== userId &&
         !message.read_by?.includes(userId) &&
@@ -938,13 +1021,13 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [activeTab, messages, session?.user.id, showError]);
+  }, [activeTab, session?.user.id, showError, teamMessages]);
 
   const filteredMessages = useMemo(() => {
     const term = search.trim().toLowerCase();
-    if (!term) return messages;
-    return messages.filter((message) => message.content.toLowerCase().includes(term));
-  }, [messages, search]);
+    if (!term) return teamMessages;
+    return teamMessages.filter((message) => message.content.toLowerCase().includes(term));
+  }, [search, teamMessages]);
 
   const typingMembers = onlineMembers.filter(
     (member) => member.user_id !== session?.user.id && member.isTyping
@@ -963,29 +1046,20 @@ export default function App() {
                 ['admin', 'leader'].includes(member.role.toLowerCase())
             ))
       );
+  const isMember = profile?.role === 'member';
   const visibleTasks = useMemo(
     () =>
       tasks.filter(
-        (task) => {
-          if (isWorkspaceLeader) {
-            return (
-              task.created_by === currentUser?.id ||
-              (task.target_type === 'personal' &&
-                members.some(
-                  (member) =>
-                    member.id === task.assignee_id && member.leader_id === currentUser?.id
-                ))
-            );
-          }
-          return (
-            Boolean(profile?.leader_id) &&
-            task.created_by === profile?.leader_id &&
-            (task.target_type !== 'personal' || task.assignee_id === currentUser?.id)
-          );
-        }
+        (task) =>
+          Boolean(activeLeaderId && task.created_by === activeLeaderId) &&
+          (!isMember ||
+            task.target_type === 'team' ||
+            (task.target_type === 'personal' && task.assignee_id === currentUser?.id))
       ),
-    [currentUser, isWorkspaceLeader, members, profile?.leader_id, tasks]
+    [activeLeaderId, currentUser?.id, isMember, tasks]
   );
+  const canEditDocument = (document: DocumentRecord) =>
+    isWorkspaceLeader || document.created_by === currentUser?.id;
   const activeTaskCount = visibleTasks.filter(
     (task) => task.status === 'todo' || task.status === 'in_progress'
   ).length;
@@ -1052,7 +1126,7 @@ export default function App() {
       {
         label: 'Pesan Obrolan',
         tab: 'messages' as const,
-        items: messages
+        items: teamMessages
           .filter((message) => message.content.toLowerCase().includes(term))
           .map((message) => ({
             id: message.id,
@@ -1106,7 +1180,7 @@ export default function App() {
           })),
       },
     ];
-  }, [documents, events, messages, search, visibleTasks]);
+  }, [documents, events, search, teamMessages, visibleTasks]);
 
   const historyTasks = useMemo(() => {
     const term = historySearch.trim().toLowerCase();
@@ -1342,13 +1416,14 @@ export default function App() {
 
   const handleSendMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!newMessage.trim() || !activeChannel || !session?.user) return;
+    if (!newMessage.trim() || !activeChannel || !session?.user || !activeLeaderId) return;
     const content = newMessage.trim();
     trackTypingStatus(false);
     setNewMessage('');
     const { error } = await supabase.from('messages').insert({
       channel_id: activeChannel.id,
       sender_id: session.user.id,
+      leader_group_id: activeLeaderId,
       content,
     });
     if (error) {
@@ -1535,6 +1610,13 @@ export default function App() {
 
   const uploadTaskFile = async (task: Task, file: File, kind: 'instruction' | 'submission') => {
     if (!workspace || !session?.user) return;
+    if (
+      !visibleTasks.some((visibleTask) => visibleTask.id === task.id) ||
+      (isMember && kind !== 'submission')
+    ) {
+      showError('Anda tidak memiliki izin untuk mengunggah file ini.');
+      return;
+    }
     setTaskUploadBusyId(task.id);
     const path = `${workspace.id}/tasks/${task.id}/${kind}-${crypto.randomUUID()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
     const { error: uploadError } = await supabase.storage.from('task-files').upload(path, file);
@@ -1548,7 +1630,11 @@ export default function App() {
       kind === 'instruction'
         ? { instruction_file_url: fileUrl, instruction_file_name: file.name }
         : { submission_file_url: fileUrl, submission_file_name: file.name };
-    const { error: updateError } = await supabase.from('tasks').update(update).eq('id', task.id);
+    const { error: updateError } = await supabase
+      .from('tasks')
+      .update(update)
+      .eq('id', task.id)
+      .eq('created_by', activeLeaderId || '');
     setTaskUploadBusyId(null);
     if (updateError) {
       const { error: cleanupError } = await supabase.storage.from('task-files').remove([path]);
@@ -1565,11 +1651,19 @@ export default function App() {
   };
 
   const updateTaskStatus = async (task: Task, status: Task['status']) => {
+    if (!visibleTasks.some((visibleTask) => visibleTask.id === task.id)) {
+      showError('Anda tidak memiliki izin untuk mengubah status tugas ini.');
+      return;
+    }
     const previousStatus = task.status;
     setTasks((previous) =>
       previous.map((item) => (item.id === task.id ? { ...item, status } : item))
     );
-    const { error } = await supabase.from('tasks').update({ status }).eq('id', task.id);
+    const { error } = await supabase
+      .from('tasks')
+      .update({ status })
+      .eq('id', task.id)
+      .eq('created_by', activeLeaderId || '');
     if (error) {
       setTasks((previous) =>
         previous.map((item) =>
@@ -1593,6 +1687,7 @@ export default function App() {
   };
 
   const startEditingEvent = (event: TeamEvent) => {
+    if (isMember || event.created_by !== activeLeaderId) return;
     setEditingEventId(event.id);
     setNewEventTitle(event.title);
     setNewEventDate(toDateTimeLocalValue(event.start_time));
@@ -1604,6 +1699,10 @@ export default function App() {
   const handleAddEvent = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!newEventTitle.trim() || !newEventDate || !workspace || !session?.user) return;
+    if (!isWorkspaceLeader || isMember || !activeLeaderId) {
+      showError('Member tidak memiliki izin untuk menjadwalkan atau mengubah agenda.');
+      return;
+    }
     if (newEventMeetingType === 'offline' && !newEventLocation.trim()) {
       showError('Tempat / Lokasi Rapat wajib diisi untuk rapat offline.');
       return;
@@ -1634,6 +1733,7 @@ export default function App() {
           .update(eventValues)
           .eq('id', editingEventId)
           .eq('workspace_id', workspace.id)
+          .eq('created_by', activeLeaderId)
           .select()
           .single()
       : supabase
@@ -1675,6 +1775,10 @@ export default function App() {
   };
 
   const deleteEvent = async (event: TeamEvent) => {
+    if (isMember || event.created_by !== activeLeaderId) {
+      showError('Anda tidak memiliki izin untuk menghapus agenda ini.');
+      return;
+    }
     const confirmed = window.confirm(
       `Hapus agenda "${event.title}"? Tindakan ini tidak dapat dibatalkan.`
     );
@@ -1685,6 +1789,7 @@ export default function App() {
       .delete()
       .eq('id', event.id)
       .eq('workspace_id', workspace.id)
+      .eq('created_by', activeLeaderId || '')
       .select('id')
       .single();
     setBusy(false);
@@ -1699,6 +1804,10 @@ export default function App() {
 
   const createInstantMeeting = async () => {
     if (!workspace || !session?.user) return;
+    if (!isWorkspaceLeader || isMember || !activeLeaderId) {
+      showError('Member tidak memiliki izin untuk membuat rapat instan.');
+      return;
+    }
     const start = new Date();
     const end = new Date(start.getTime() + 60 * 60 * 1000);
     const roomId = `teamhub-${crypto.randomUUID().slice(0, 10)}`;
@@ -1743,6 +1852,27 @@ export default function App() {
     }
   };
 
+  const notifyCollaborativeDocument = async (
+    document: DocumentRecord,
+    action: 'menambahkan' | 'memperbarui'
+  ) => {
+    if (!workspace || !session?.user || profile?.role !== 'member' || !activeLeaderId) return;
+    const recipientIds = [...teamUserIds].filter((userId) => userId !== session.user.id);
+    if (recipientIds.length === 0) return;
+    const memberName = profile.full_name || session.user.email || 'Member';
+    const { error } = await supabase.from('notifications').insert(
+      recipientIds.map((userId) => ({
+        workspace_id: workspace.id,
+        user_id: userId,
+        title: 'Notulensi kolaboratif',
+        content: `${memberName} ${action} notulensi: ${document.title || 'Tanpa judul'}`,
+      }))
+    );
+    if (error) {
+      showError(`Notulensi tersimpan, tetapi notifikasi kolaboratif gagal dikirim: ${error.message}`);
+    }
+  };
+
   const createDocument = async () => {
     if (!workspace || !session?.user) return;
     setBusy(true);
@@ -1763,6 +1893,7 @@ export default function App() {
     }
     const document = data as DocumentRecord;
     setDocuments((previous) => [document, ...previous]);
+    await notifyCollaborativeDocument(document, 'menambahkan');
     focusDocumentAfterSelectRef.current = true;
     setSelectedDocumentId(document.id);
     setDocumentRevisions([]);
@@ -1776,6 +1907,10 @@ export default function App() {
   const handleSaveDocument = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!selectedDocument || !session?.user || !workspace) return;
+    if (!canEditDocument(selectedDocument)) {
+      showError('Anda tidak memiliki izin untuk mengubah notulensi ini.');
+      return;
+    }
     const savedTitle = documentTitle.trim() || 'Tanpa judul';
     const savedContent = documentContent;
     const updatedAt = new Date().toISOString();
@@ -1790,6 +1925,7 @@ export default function App() {
       })
       .eq('id', selectedDocument.id)
       .eq('workspace_id', workspace.id)
+      .eq('created_by', selectedDocument.created_by || '')
       .select()
       .single();
     if (error) {
@@ -1803,6 +1939,7 @@ export default function App() {
     );
     setDocumentTitle(saved.title);
     setDocumentContent(saved.content);
+    await notifyCollaborativeDocument(saved, 'memperbarui');
 
     const { data: revision, error: revisionError } = await supabase
       .from('document_revisions')
@@ -1912,6 +2049,10 @@ export default function App() {
 
   const restoreDocumentRevision = async (revision: DocumentRevision) => {
     if (!selectedDocument || !workspace || !session?.user) return;
+    if (!canEditDocument(selectedDocument)) {
+      showError('Anda tidak memiliki izin untuk memulihkan versi notulensi ini.');
+      return;
+    }
     const updatedAt = new Date().toISOString();
     setBusy(true);
     const { data, error } = await supabase
@@ -1924,6 +2065,7 @@ export default function App() {
       })
       .eq('id', selectedDocument.id)
       .eq('workspace_id', workspace.id)
+      .eq('created_by', selectedDocument.created_by || '')
       .select()
       .single();
     if (error) {
@@ -1975,6 +2117,7 @@ export default function App() {
   };
 
   const editDocument = (document: DocumentRecord) => {
+    if (!canEditDocument(document)) return;
     if (selectedDocumentId === document.id) {
       const titleInput = documentTitleInputRef.current;
       if (titleInput) {
@@ -1990,6 +2133,10 @@ export default function App() {
   };
 
   const deleteDocument = async (document: DocumentRecord) => {
+    if (!canEditDocument(document)) {
+      showError('Anda tidak memiliki izin untuk menghapus notulensi ini.');
+      return;
+    }
     const confirmed = window.confirm(
       `Hapus notulensi "${document.title || 'Tanpa judul'}"? Tindakan ini tidak dapat dibatalkan.`
     );
@@ -2000,7 +2147,8 @@ export default function App() {
       .from('documents')
       .delete()
       .eq('id', document.id)
-      .eq('workspace_id', document.workspace_id);
+      .eq('workspace_id', document.workspace_id)
+      .eq('created_by', document.created_by || '');
     setBusy(false);
     if (error) {
       showError(`Notulensi tidak dapat dihapus: ${error.message}`);
@@ -2057,6 +2205,11 @@ export default function App() {
       showError('Pilih Leader pembimbing untuk akun Member.');
       return;
     }
+    const profileChanged =
+      nextFullName !== (profile?.full_name ?? '') ||
+      nextAvatarUrl !== (profile?.avatar_url ?? '') ||
+      settingsRole !== (profile?.role ?? 'member') ||
+      (settingsRole === 'member' ? settingsLeaderId : null) !== (profile?.leader_id ?? null);
     if (
       nextAvatarUrl &&
       !nextAvatarUrl.startsWith('data:image/') &&
@@ -2067,12 +2220,7 @@ export default function App() {
     }
 
     setBusy(true);
-    if (
-      nextFullName !== (profile?.full_name ?? '') ||
-      nextAvatarUrl !== (profile?.avatar_url ?? '') ||
-      settingsRole !== (profile?.role ?? 'member') ||
-      (settingsRole === 'member' ? settingsLeaderId : null) !== (profile?.leader_id ?? null)
-    ) {
+    if (profileChanged) {
       const { data: updatedProfile, error } = await supabase
         .from('profiles')
         .upsert(
@@ -2092,6 +2240,11 @@ export default function App() {
         showError(`Profil tidak dapat disimpan: ${error.message}`);
         return;
       }
+      setMessages([]);
+      setTasks([]);
+      setMembers([]);
+      setEvents([]);
+      setDocuments([]);
       setProfile(updatedProfile as Profile);
     }
 
@@ -2108,6 +2261,20 @@ export default function App() {
         return;
       }
       setWorkspace(data as Workspace);
+    }
+
+    if (profileChanged) {
+      try {
+        await refreshWorkspace(session.user);
+      } catch (error) {
+        setBusy(false);
+        showError(
+          `Profil tersimpan, tetapi data kelompok tidak dapat dimuat ulang: ${
+            error instanceof Error ? error.message : 'terjadi kesalahan'
+          }`
+        );
+        return;
+      }
     }
 
     setBusy(false);
@@ -2387,14 +2554,16 @@ export default function App() {
             </button>
             {showCreateMenu && (
               <div className="absolute left-0 top-full z-30 mt-2 w-52 rounded-xl border border-slate-700 bg-slate-800 p-1.5 shadow-2xl">
-                <button
-                  type="button"
-                  onClick={openNewTask}
-                  className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-slate-200 hover:bg-slate-700"
-                >
-                  <CheckSquare className="h-4 w-4 text-indigo-300" />
-                  Buat Tugas
-                </button>
+                {isWorkspaceLeader && (
+                  <button
+                    type="button"
+                    onClick={openNewTask}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-slate-200 hover:bg-slate-700"
+                  >
+                    <CheckSquare className="h-4 w-4 text-indigo-300" />
+                    Buat Tugas
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => void createDocument()}
@@ -2404,17 +2573,19 @@ export default function App() {
                   <FileText className="h-4 w-4 text-indigo-300" />
                   Notulensi Baru
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    navigateToTab('calendar');
-                    setShowCreateMenu(false);
-                  }}
-                  className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-slate-200 hover:bg-slate-700"
-                >
-                  <CalendarDays className="h-4 w-4 text-indigo-300" />
-                  Jadwalkan Rapat
-                </button>
+                {isWorkspaceLeader && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigateToTab('calendar');
+                      setShowCreateMenu(false);
+                    }}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-slate-200 hover:bg-slate-700"
+                  >
+                    <CalendarDays className="h-4 w-4 text-indigo-300" />
+                    Jadwalkan Rapat
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -2433,7 +2604,7 @@ export default function App() {
               id === 'tasks'
                 ? pendingTaskCount
                 : id === 'messages'
-                  ? messages.length
+                  ? teamMessages.length
                   : id === 'meetings'
                     ? activeMeetings.length
                     : id === 'calendar'
@@ -2927,23 +3098,27 @@ export default function App() {
                     <Sparkles className="h-5 w-5 text-indigo-300" />
                   </div>
                   <div className="grid gap-2">
-                    <button
-                      type="button"
-                      onClick={openNewTask}
-                      className="flex items-center gap-2.5 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-3 text-left text-xs font-medium text-slate-200 transition hover:border-indigo-500/40 hover:bg-slate-800"
-                    >
-                      <CheckSquare className="h-4 w-4 text-indigo-300" />
-                      + Buat Tugas
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void createInstantMeeting()}
-                      disabled={busy}
-                      className="flex items-center gap-2.5 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-3 text-left text-xs font-medium text-slate-200 transition hover:border-indigo-500/40 hover:bg-slate-800 disabled:opacity-50"
-                    >
-                      <Video className="h-4 w-4 text-indigo-300" />
-                      Mulai Rapat Video
-                    </button>
+                    {isWorkspaceLeader && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={openNewTask}
+                          className="flex items-center gap-2.5 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-3 text-left text-xs font-medium text-slate-200 transition hover:border-indigo-500/40 hover:bg-slate-800"
+                        >
+                          <CheckSquare className="h-4 w-4 text-indigo-300" />
+                          + Buat Tugas
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void createInstantMeeting()}
+                          disabled={busy}
+                          className="flex items-center gap-2.5 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-3 text-left text-xs font-medium text-slate-200 transition hover:border-indigo-500/40 hover:bg-slate-800 disabled:opacity-50"
+                        >
+                          <Video className="h-4 w-4 text-indigo-300" />
+                          Mulai Rapat Video
+                        </button>
+                      </>
+                    )}
                     <button
                       type="button"
                       onClick={() => void createDocument()}
@@ -3143,15 +3318,17 @@ export default function App() {
                   <p className="mt-2 max-w-md text-sm leading-6 text-slate-400">
                     Buat ruang Jitsi instan atau bergabung kembali ke rapat yang sedang berlangsung.
                   </p>
-                  <button
-                    type="button"
-                    onClick={() => void createInstantMeeting()}
-                    disabled={busy || !workspace}
-                    className="mt-5 inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-400 disabled:opacity-50"
-                  >
-                    <Plus className="h-4 w-4" />
-                    Mulai rapat instan
-                  </button>
+                  {isWorkspaceLeader && (
+                    <button
+                      type="button"
+                      onClick={() => void createInstantMeeting()}
+                      disabled={busy || !workspace}
+                      className="mt-5 inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-400 disabled:opacity-50"
+                    >
+                      <Plus className="h-4 w-4" />
+                      Mulai rapat instan
+                    </button>
+                  )}
                 </div>
                 <Video className="absolute -bottom-8 -right-4 h-48 w-48 text-indigo-400/[0.06]" />
               </div>
@@ -3274,10 +3451,11 @@ export default function App() {
                   <p className="mt-1 text-xs text-slate-500">Jadwal rapat dan acara tim</p>
                 </div>
               </div>
-              <form
-                onSubmit={handleAddEvent}
-                className="mb-7 grid gap-3 rounded-xl border border-slate-800 bg-slate-900 p-4 sm:grid-cols-2"
-              >
+              {isWorkspaceLeader && (
+                <form
+                  onSubmit={handleAddEvent}
+                  className="mb-7 grid gap-3 rounded-xl border border-slate-800 bg-slate-900 p-4 sm:grid-cols-2"
+                >
                 <input
                   value={newEventTitle}
                   onChange={(event) => setNewEventTitle(event.target.value)}
@@ -3347,7 +3525,8 @@ export default function App() {
                     {editingEventId ? 'Simpan Perubahan' : 'Jadwalkan'}
                   </button>
                 </div>
-              </form>
+                </form>
+              )}
               <div className="space-y-3">
                 {upcomingEvents.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-slate-800 py-16 text-center">
@@ -3404,26 +3583,30 @@ export default function App() {
                             Tatap Muka / Offline
                           </span>
                         ) : null}
-                        <button
-                          type="button"
-                          onClick={() => startEditingEvent(event)}
-                          disabled={busy}
-                          title="Edit agenda"
-                          aria-label={`Edit agenda ${event.title}`}
-                          className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void deleteEvent(event)}
-                          disabled={busy}
-                          title="Hapus agenda"
-                          aria-label={`Hapus agenda ${event.title}`}
-                          className="rounded-lg p-2 text-red-400 transition hover:bg-red-500/10 hover:text-red-300 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        {isWorkspaceLeader && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => startEditingEvent(event)}
+                              disabled={busy}
+                              title="Edit agenda"
+                              aria-label={`Edit agenda ${event.title}`}
+                              className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void deleteEvent(event)}
+                              disabled={busy}
+                              title="Hapus agenda"
+                              aria-label={`Hapus agenda ${event.title}`}
+                              className="rounded-lg p-2 text-red-400 transition hover:bg-red-500/10 hover:text-red-300 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          </>
+                        )}
                       </div>
                     </article>
                   ))
@@ -3747,33 +3930,35 @@ export default function App() {
                           <FileText className="h-3.5 w-3.5 shrink-0 text-indigo-300" />
                           <span className="truncate">{document.title || 'Tanpa judul'}</span>
                         </button>
-                        <div
-                          className={`flex shrink-0 items-center pr-1 transition-opacity ${
-                            isSelected
-                              ? 'opacity-100'
-                              : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            onClick={() => editDocument(document)}
-                            title="Edit notulensi"
-                            aria-label={`Edit notulensi ${document.title || 'Tanpa judul'}`}
-                            className="rounded-md p-1.5 text-slate-500 transition hover:bg-slate-700 hover:text-indigo-300"
+                        {canEditDocument(document) && (
+                          <div
+                            className={`flex shrink-0 items-center pr-1 transition-opacity ${
+                              isSelected
+                                ? 'opacity-100'
+                                : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
+                            }`}
                           >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void deleteDocument(document)}
-                            disabled={busy}
-                            title="Hapus notulensi"
-                            aria-label={`Hapus notulensi ${document.title || 'Tanpa judul'}`}
-                            className="rounded-md p-1.5 text-slate-500 transition hover:bg-red-500/10 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
+                            <button
+                              type="button"
+                              onClick={() => editDocument(document)}
+                              title="Edit notulensi"
+                              aria-label={`Edit notulensi ${document.title || 'Tanpa judul'}`}
+                              className="rounded-md p-1.5 text-slate-500 transition hover:bg-slate-700 hover:text-indigo-300"
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void deleteDocument(document)}
+                              disabled={busy}
+                              title="Hapus notulensi"
+                              aria-label={`Hapus notulensi ${document.title || 'Tanpa judul'}`}
+                              className="rounded-md p-1.5 text-slate-500 transition hover:bg-red-500/10 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -3805,6 +3990,7 @@ export default function App() {
                           <input
                             value={documentTitle}
                             onChange={(event) => setDocumentTitle(event.target.value)}
+                            readOnly={!canEditDocument(selectedDocument)}
                             ref={documentTitleInputRef}
                             aria-label="Judul notulensi"
                             className="w-full bg-transparent text-base font-semibold text-slate-100 outline-none placeholder:text-slate-600"
@@ -3825,19 +4011,22 @@ export default function App() {
                             <Printer className="h-3.5 w-3.5" />
                             Cetak / PDF
                           </button>
-                          <button
-                            type="submit"
-                            disabled={busy}
-                            className="flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
-                          >
-                            <Check className="h-3.5 w-3.5" />
-                            Simpan
-                          </button>
+                          {canEditDocument(selectedDocument) && (
+                            <button
+                              type="submit"
+                              disabled={busy}
+                              className="flex items-center gap-2 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+                            >
+                              <Check className="h-3.5 w-3.5" />
+                              Simpan
+                            </button>
+                          )}
                         </div>
                       </div>
                       <textarea
                         value={documentContent}
                         onChange={(event) => setDocumentContent(event.target.value)}
+                        readOnly={!canEditDocument(selectedDocument)}
                         ref={documentContentInputRef}
                         aria-label="Isi notulensi"
                         placeholder="Mulai menulis notulensi tim..."
@@ -3901,15 +4090,17 @@ export default function App() {
                                     })}
                                   </time>
                                 </div>
-                                <button
-                                  type="button"
-                                  onClick={() => void restoreDocumentRevision(selectedRevision)}
-                                  disabled={busy}
-                                  className="flex shrink-0 items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-[11px] font-medium text-indigo-200 transition hover:bg-indigo-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-                                >
-                                  <RotateCcw className="h-3.5 w-3.5" />
-                                  Pulihkan Versi Ini
-                                </button>
+                                {canEditDocument(selectedDocument) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void restoreDocumentRevision(selectedRevision)}
+                                    disabled={busy}
+                                    className="flex shrink-0 items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-[11px] font-medium text-indigo-200 transition hover:bg-indigo-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    <RotateCcw className="h-3.5 w-3.5" />
+                                    Pulihkan Versi Ini
+                                  </button>
+                                )}
                               </div>
                               <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words font-sans text-xs leading-5 text-slate-400">
                                 {selectedRevision.content || 'Versi ini tidak berisi catatan.'}
