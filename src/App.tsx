@@ -845,7 +845,7 @@ export default function App() {
 
     const { data, error } = await supabase
       .from('messages')
-      .select('*, profiles(full_name)')
+      .select('*, profiles!messages_user_id_fkey(full_name)')
       .eq('channel_id', activeChannel.id)
       .or(
         `leader_group_id.eq.${activeLeaderId},sender_id.in.(${[...teamUserIds].join(',')})`
@@ -2554,7 +2554,7 @@ export default function App() {
             </button>
             {showCreateMenu && (
               <div className="absolute left-0 top-full z-30 mt-2 w-52 rounded-xl border border-slate-700 bg-slate-800 p-1.5 shadow-2xl">
-                {isWorkspaceLeader && (
+                {profile?.role !== 'member' && isWorkspaceLeader && (
                   <button
                     type="button"
                     onClick={openNewTask}
@@ -2573,7 +2573,7 @@ export default function App() {
                   <FileText className="h-4 w-4 text-indigo-300" />
                   Notulensi Baru
                 </button>
-                {isWorkspaceLeader && (
+                {profile?.role !== 'member' && isWorkspaceLeader && (
                   <button
                     type="button"
                     onClick={() => {
@@ -3451,7 +3451,7 @@ export default function App() {
                   <p className="mt-1 text-xs text-slate-500">Jadwal rapat dan acara tim</p>
                 </div>
               </div>
-              {isWorkspaceLeader && (
+              {profile?.role !== 'member' && isWorkspaceLeader && (
                 <form
                   onSubmit={handleAddEvent}
                   className="mb-7 grid gap-3 rounded-xl border border-slate-800 bg-slate-900 p-4 sm:grid-cols-2"
@@ -3583,7 +3583,7 @@ export default function App() {
                             Tatap Muka / Offline
                           </span>
                         ) : null}
-                        {isWorkspaceLeader && (
+                        {profile?.role !== 'member' && isWorkspaceLeader && (
                           <>
                             <button
                               type="button"
