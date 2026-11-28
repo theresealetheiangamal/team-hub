@@ -65,11 +65,11 @@ type TeamMessage = {
   id: string;
   channel_id: string;
   sender_id: string;
+  user_id?: string;
   leader_group_id?: string | null;
   content: string;
   created_at: string;
   read_by?: string[] | null;
-  profiles?: { full_name: string | null } | null;
 };
 type TeamPresence = {
   user_id: string;
@@ -199,6 +199,10 @@ function getTaskHistoryDate(task: Task) {
   return task.completed_at || task.updated_at || task.created_at;
 }
 
+function getMessageSenderId(message: TeamMessage) {
+  return message.user_id || message.sender_id;
+}
+
 function toDateTimeLocalValue(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '';
@@ -317,10 +321,20 @@ export default function App() {
             activeLeaderId &&
               message.channel_id === activeChannel?.id &&
               (message.leader_group_id === activeLeaderId ||
-                teamUserIds.has(message.sender_id))
+                teamUserIds.has(getMessageSenderId(message)))
           )
       ),
     [activeChannel?.id, activeLeaderId, messages, teamUserIds]
+  );
+  const messageSenderNames = useMemo(
+    () =>
+      new Map(
+        [
+          ...members.map((member) => [member.id, member.full_name] as const),
+          ...(profile ? [[profile.id, profile.full_name || 'Anggota'] as const] : []),
+        ]
+      ),
+    [members, profile]
   );
 
   const showError = useCallback((message: string) => {
@@ -342,20 +356,19 @@ export default function App() {
       const channel = presenceChannelRef.current;
       if (!channel || !session?.user) return;
 
-      void channel
-        .track({
-          user_id: session.user.id,
-          full_name: profile?.full_name || session.user.email || 'Anggota',
-          isTyping,
-        })
-        .then((status) => {
-          if (status !== 'ok') showError('Status mengetik tidak dapat disinkronkan.');
-        })
-        .catch((error: Error) => {
-          showError(`Status mengetik tidak dapat disinkronkan: ${error.message}`);
-        });
+      void (async () => {
+        try {
+          await channel.track({
+            user_id: session.user.id,
+            full_name: profile?.full_name || session.user.email || 'Anggota',
+            isTyping,
+          });
+        } catch {
+          return;
+        }
+      })();
     },
-    [profile?.full_name, session, showError]
+    [profile, session]
   );
   const navigateToTab = (tab: Tab) => {
     setActiveTab(tab);
@@ -845,7 +858,7 @@ export default function App() {
 
     const { data, error } = await supabase
       .from('messages')
-      .select('*, profiles!messages_user_id_fkey(full_name)')
+      .select('*')
       .eq('channel_id', activeChannel.id)
       .or(
         `leader_group_id.eq.${activeLeaderId},sender_id.in.(${[...teamUserIds].join(',')})`
@@ -862,7 +875,7 @@ export default function App() {
         (data as TeamMessage[]).filter(
           (message) =>
             message.leader_group_id === activeLeaderId ||
-            teamUserIds.has(message.sender_id)
+            teamUserIds.has(getMessageSenderId(message))
         )
       );
     }
@@ -875,7 +888,8 @@ export default function App() {
 
     let active = true;
     const belongsToTeam = (message: TeamMessage) =>
-      message.leader_group_id === activeLeaderId || teamUserIds.has(message.sender_id);
+      message.leader_group_id === activeLeaderId ||
+      teamUserIds.has(getMessageSenderId(message));
     const realtimeChannel = supabase
       .channel(`messages-${activeChannel.id}`)
       .on(
@@ -886,20 +900,14 @@ export default function App() {
           table: 'messages',
           filter: `channel_id=eq.${activeChannel.id}`,
         },
-        async (payload) => {
+        (payload) => {
           const row = payload.new as TeamMessage;
           if (!belongsToTeam(row)) return;
-          const { data: senderProfile, error } = await supabase
-            .from('profiles')
-            .select('full_name')
-            .eq('id', row.sender_id)
-            .maybeSingle();
-          if (error) showError(`Gagal memuat profil pengirim: ${error.message}`);
           if (active) {
             setMessages((previous) =>
               previous.some((message) => message.id === row.id)
                 ? previous
-                : [...previous, { ...row, profiles: senderProfile }]
+                : [...previous, row]
             );
           }
         }
@@ -922,7 +930,7 @@ export default function App() {
           setMessages((previous) =>
             previous.map((message) =>
               message.id === row.id
-                ? { ...message, ...row, profiles: row.profiles ?? message.profiles }
+                ? { ...message, ...row }
                 : message
             )
           );
@@ -961,7 +969,7 @@ export default function App() {
     let active = true;
     const unreadMessages = teamMessages.filter(
       (message) =>
-        message.sender_id !== userId &&
+        getMessageSenderId(message) !== userId &&
         !message.read_by?.includes(userId) &&
         !markingReadMessageIdsRef.current.has(message.id)
     );
@@ -969,51 +977,56 @@ export default function App() {
     unreadMessages.forEach((message) => {
       markingReadMessageIdsRef.current.add(message.id);
       void (async () => {
-        const { data: currentMessage, error: readError } = await supabase
-          .from('messages')
-          .select('read_by')
-          .eq('id', message.id)
-          .maybeSingle();
+        try {
+          const { data: currentMessage, error: readError } = await supabase
+            .from('messages')
+            .select('read_by')
+            .eq('id', message.id)
+            .maybeSingle();
 
-        if (readError) {
-          markingReadMessageIdsRef.current.delete(message.id);
-          if (active) showError(`Status baca pesan tidak dapat dimuat: ${readError.message}`);
-          return;
-        }
-        if (!currentMessage) return;
+          if (readError) {
+            markingReadMessageIdsRef.current.delete(message.id);
+            return;
+          }
+          if (!currentMessage) {
+            markingReadMessageIdsRef.current.delete(message.id);
+            return;
+          }
 
-        const readBy = Array.isArray(currentMessage.read_by)
-          ? (currentMessage.read_by as string[])
-          : [];
-        if (readBy.includes(userId)) {
+          const readBy = Array.isArray(currentMessage.read_by)
+            ? (currentMessage.read_by as string[])
+            : [];
+          if (readBy.includes(userId)) {
+            if (active) {
+              setMessages((previous) =>
+                previous.map((item) =>
+                  item.id === message.id ? { ...item, read_by: readBy } : item
+                )
+              );
+            }
+            return;
+          }
+
+          const updatedReadBy = [...readBy, userId];
+          const { error: updateError } = await supabase
+            .from('messages')
+            .update({ read_by: updatedReadBy })
+            .eq('id', message.id);
+
+          if (updateError) {
+            markingReadMessageIdsRef.current.delete(message.id);
+            return;
+          }
+
           if (active) {
             setMessages((previous) =>
               previous.map((item) =>
-                item.id === message.id ? { ...item, read_by: readBy } : item
+                item.id === message.id ? { ...item, read_by: updatedReadBy } : item
               )
             );
           }
-          return;
-        }
-
-        const updatedReadBy = [...readBy, userId];
-        const { error: updateError } = await supabase
-          .from('messages')
-          .update({ read_by: updatedReadBy })
-          .eq('id', message.id);
-
-        if (updateError) {
+        } catch {
           markingReadMessageIdsRef.current.delete(message.id);
-          if (active) showError(`Status baca pesan tidak dapat disimpan: ${updateError.message}`);
-          return;
-        }
-
-        if (active) {
-          setMessages((previous) =>
-            previous.map((item) =>
-              item.id === message.id ? { ...item, read_by: updatedReadBy } : item
-            )
-          );
         }
       })();
     });
@@ -1130,7 +1143,7 @@ export default function App() {
           .filter((message) => message.content.toLowerCase().includes(term))
           .map((message) => ({
             id: message.id,
-            title: message.profiles?.full_name || 'Pesan obrolan',
+            title: messageSenderNames.get(getMessageSenderId(message)) || 'Pesan obrolan',
             detail: message.content,
           })),
       },
@@ -1180,7 +1193,7 @@ export default function App() {
           })),
       },
     ];
-  }, [documents, events, search, teamMessages, visibleTasks]);
+  }, [documents, events, messageSenderNames, search, teamMessages, visibleTasks]);
 
   const historyTasks = useMemo(() => {
     const term = historySearch.trim().toLowerCase();
@@ -3172,7 +3185,9 @@ export default function App() {
                   </div>
                 ) : (
                   filteredMessages.map((message) => {
-                    const isOwnMessage = message.sender_id === session.user.id;
+                    const senderName =
+                      messageSenderNames.get(getMessageSenderId(message)) || 'Anggota';
+                    const isOwnMessage = getMessageSenderId(message) === session.user.id;
                     const readers = [...new Set(message.read_by ?? [])].map((readerId) =>
                       getHistoryPersonName(
                         readerId,
@@ -3191,14 +3206,14 @@ export default function App() {
                               : 'bg-slate-800 text-slate-300'
                           }`}
                         >
-                          {(message.profiles?.full_name?.[0] || '?').toUpperCase()}
+                          {(senderName[0] || '?').toUpperCase()}
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-baseline gap-x-2">
                             <span className="text-sm font-medium text-slate-200">
                               {isOwnMessage
                                 ? 'Anda'
-                                : message.profiles?.full_name || 'Anggota'}
+                                  : senderName}
                             </span>
                             <time className="text-[10px] text-slate-600">
                               {new Date(message.created_at).toLocaleString('id-ID')}
